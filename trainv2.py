@@ -152,9 +152,11 @@ def main(options):
     else:
         device = torch.device("cpu")
 
+    # Create model with the chosen backbone
     model = UNet(input_bands=options['input_channels'],
                  output_classes=options['output_channels'],
-                 hidden_channels=options['hidden_channels'])
+                 hidden_channels=options['hidden_channels'],
+                 backbone=options['backbone'])
 
     model.to(device)
 
@@ -405,6 +407,9 @@ if __name__ == "__main__":
     parser.add_argument('--input_channels', default=11, type=int, help='Number of input bands')
     parser.add_argument('--output_channels', default=11, type=int, help='Number of output classes')
     parser.add_argument('--hidden_channels', default=16, type=int, help='Number of hidden features')
+    parser.add_argument('--backbone', default='none', type=str,
+                        choices=['none', 'resnet18', 'mobilenetv2', 'efficientnetv2'],
+                        help='Backbone encoder type (none for original UNet)')
     parser.add_argument('--weight_param', default=1.03, type=float, help='Weighting parameter for Loss Function')
 
     parser.add_argument('--loss_type', default='ce', choices=['ce', 'focal'], help='Loss type')

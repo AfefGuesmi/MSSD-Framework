@@ -170,3 +170,11 @@ def gen_weights(class_distribution, c=1.02):
         torch.Tensor: Class weights.
     """
     return 1.0 / torch.log(c + class_distribution)
+
+
+# =====================================================================
+# Aliases for compatibility with trainv2.py (which expects lowercase names)
+# =====================================================================
+bands_mean = BANDS_MEAN
+bands_std = BANDS_STD
+class_distr = CLASS_DISTR
