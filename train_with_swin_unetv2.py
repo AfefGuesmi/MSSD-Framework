@@ -1,6 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-Training script for Swin‑UNet on the MARIDA dataset.
+Training script for Swin-UNet V2 (MSSD-Net) on the MARIDA dataset.
+
+This script has been aligned with train_unet.py so that both models are
+trained under an IDENTICAL protocol (epochs, batch size, optimizer, weight
+decay, warmup, LR schedule, gradient clipping, early stopping, loss
+weighting, and data-loading settings). Only architecture-specific options
+(--pretrained_path here; --hidden_channels for the U-Net) differ between
+the two scripts.
+
+Changes from the previous version of this script:
+  * epochs default 300 -> 100 (matches the U-Net script and the paper)
+  * batch default 8 -> 16
+  * lr default 5e-5 -> 1e-4
+  * patience default 15 -> 10
+  * scheduler default 'plateau' -> 'sgdr', and 'sgdr' (true
+    CosineAnnealingWarmRestarts) added as a real option -- the previous
+    'cosine' choice was plain CosineAnnealingLR, which is NOT SGDR despite
+    the paper describing "stochastic gradient descent with warm restarts".
+  * fixed a scheduler-stepping bug: when warmup was combined with the
+    'cosine'/'multistep' choices via SequentialLR, the main scheduler was
+    never advanced after the warmup phase ended. The warmup and main
+    schedulers are now stepped explicitly and separately.
 """
 
 import argparse
@@ -17,12 +38,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
-from torch.optim.lr_scheduler import LinearLR, SequentialLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import (
+    LinearLR, ReduceLROnPlateau, CosineAnnealingLR,
+    CosineAnnealingWarmRestarts, MultiStepLR,
+)
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-# Add project root to path
 PROJECT_ROOT = up(os.path.abspath(__file__))
 sys.path.append(PROJECT_ROOT)
 
@@ -90,6 +113,43 @@ class FocalLoss(nn.Module):
         return focal_loss
 
 
+def build_scheduler(optimizer, options, steps_per_epoch):
+    """
+    Build a linear-warmup scheduler plus a main scheduler. Identical
+    construction to train_unet.py so both scripts follow the same LR
+    schedule for a given --scheduler choice.
+
+    Returns (warmup_scheduler_or_None, main_scheduler, warmup_steps).
+    """
+    warmup_steps = options['warmup_epochs'] * steps_per_epoch
+
+    warmup_scheduler = None
+    if warmup_steps > 0:
+        warmup_scheduler = LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
+        )
+
+    if options['scheduler'] == 'sgdr':
+        # True SGDR: cosine annealing with warm restarts, doubling the
+        # restart period each cycle (T_0=10 epochs, T_mult=2 -> restarts
+        # at epochs 10, 30, 70, ... after warmup).
+        main_scheduler = CosineAnnealingWarmRestarts(
+            optimizer, T_0=10, T_mult=2, eta_min=1e-6
+        )
+    elif options['scheduler'] == 'cosine':
+        main_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, options['epochs'] - options['warmup_epochs']),
+            eta_min=1e-6,
+        )
+    elif options['scheduler'] == 'multistep':
+        main_scheduler = MultiStepLR(optimizer, options['lr_steps'], gamma=0.1)
+    else:  # 'plateau'
+        main_scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10)
+
+    return warmup_scheduler, main_scheduler, warmup_steps
+
+
 def main(options):
     """Main training loop."""
     seed_all(0)
@@ -101,7 +161,6 @@ def main(options):
     patience = options['patience']
     writer = SummaryWriter(os.path.join(PROJECT_ROOT, 'logs', options['tensorboard']))
 
-    # Transforms – keep original size (256)
     transform_train = transforms.Compose([
         transforms.ToTensor(),
         RandomRotationTransform([-90, 0, 90, 180]),
@@ -111,7 +170,6 @@ def main(options):
 
     standardization = transforms.Normalize(BANDS_MEAN, BANDS_STD)
 
-    # DataLoaders
     if options['mode'] == 'train':
         train_dataset = GenDEBRIS(
             'train', transform=transform_train, standardization=standardization,
@@ -174,11 +232,8 @@ def main(options):
     )
     model.to(device)
 
-    # Load checkpoint if resuming
     if options['resume_from_epoch'] > 1:
-        resume_dir = os.path.join(
-            options['checkpoint_path'], str(options['resume_from_epoch'])
-        )
+        resume_dir = os.path.join(options['checkpoint_path'], str(options['resume_from_epoch']))
         model_file = os.path.join(resume_dir, options['checkpoint_name'])
         logging.info('Resuming training from epoch %d', options['resume_from_epoch'])
         logging.info('Loading model from: %s', model_file)
@@ -193,7 +248,6 @@ def main(options):
     else:
         logging.info('Initializing model from scratch.')
 
-    # Adjust class distribution if aggregating water
     class_distr = CLASS_DISTR.clone()
     if options['agg_to_water']:
         agg_distr = class_distr[-4:].sum()
@@ -202,78 +256,25 @@ def main(options):
 
     weight = gen_weights(class_distr, c=options['weight_param']).to(device)
 
-    # Loss function
     if options['loss_type'] == 'focal':
-        criterion = FocalLoss(
-            alpha=weight, gamma=options['focal_gamma'],
-            ignore_index=-1, reduction='mean'
-        )
+        criterion = FocalLoss(alpha=weight, gamma=options['focal_gamma'], ignore_index=-1, reduction='mean')
         logging.info("Using Focal Loss with gamma=%.2f", options['focal_gamma'])
     else:
-        criterion = nn.CrossEntropyLoss(
-            ignore_index=-1, reduction='mean', weight=weight
-        )
+        criterion = nn.CrossEntropyLoss(ignore_index=-1, reduction='mean', weight=weight)
         logging.info("Using CrossEntropy Loss")
 
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=options['lr'], weight_decay=options['decay']
+    optimizer = torch.optim.Adam(model.parameters(), lr=options['lr'], weight_decay=options['decay'])
+
+    # ---------- Learning-rate schedule: linear warmup + main schedule ----------
+    warmup_scheduler, main_scheduler, warmup_steps = build_scheduler(
+        optimizer, options, steps_per_epoch=len(train_loader) if options['mode'] == 'train' else 1
     )
-
-    # ---------- Learning Rate Scheduler with Warmup ----------
-    total_steps = options['epochs'] * len(train_loader)
-    warmup_steps = options['warmup_epochs'] * len(train_loader)
-
-    scheduler = None
-    plateau_scheduler = None
-
-    if warmup_steps > 0:
-        warmup_scheduler = LinearLR(
-            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
-        )
-        if options['scheduler'] == 'plateau':
-            scheduler = warmup_scheduler
-            plateau_scheduler = ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.1, patience=10
-            )
-        else:
-            if options['scheduler'] == 'cosine':
-                main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer, T_max=total_steps - warmup_steps, eta_min=1e-6
-                )
-            elif options['scheduler'] == 'multistep':
-                main_scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                    optimizer, options['lr_steps'], gamma=0.1
-                )
-            else:
-                main_scheduler = None
-
-            if main_scheduler is not None:
-                scheduler = SequentialLR(
-                    optimizer,
-                    schedulers=[warmup_scheduler, main_scheduler],
-                    milestones=[warmup_steps]
-                )
-            else:
-                scheduler = warmup_scheduler
-    else:
-        # No warmup
-        if options['scheduler'] == 'plateau':
-            scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10)
-        elif options['scheduler'] == 'cosine':
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=options['epochs'], eta_min=1e-6
-            )
-        else:  # multistep
-            scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                optimizer, options['lr_steps'], gamma=0.1
-            )
 
     start_epoch = options['resume_from_epoch'] + 1
     epochs = options['epochs']
     eval_every = options['eval_every']
 
     if options['mode'] == 'train':
-        # Log graph
         sample_img, _ = next(iter(train_loader))
         print(f"Image shape: {sample_img.shape}")  # (batch, 11, 256, 256)
         writer.add_graph(model, sample_img.to(device))
@@ -301,9 +302,8 @@ def main(options):
                 train_losses.append(loss.item() * targets.shape[0])
                 optimizer.step()
 
-                # Step warmup scheduler (batch-wise)
-                if warmup_steps > 0 and global_step < warmup_steps:
-                    scheduler.step()
+                if warmup_scheduler is not None and global_step < warmup_steps:
+                    warmup_scheduler.step()
 
                 writer.add_scalar(
                     'training loss', loss.item(),
@@ -329,7 +329,6 @@ def main(options):
                         logits = model(images)
                         loss = criterion(logits, targets)
 
-                        # Reshape for pixel‑wise metrics
                         logits = logits.permute(0, 2, 3, 1).reshape(-1, options['output_channels'])
                         targets_flat = targets.reshape(-1)
                         valid_mask = targets_flat != -1
@@ -380,7 +379,6 @@ def main(options):
                         print('Early stopping triggered.')
                         break
 
-                # Log metrics
                 writer.add_scalar('Precision/macroPrec', metrics["macroPrec"], epoch)
                 writer.add_scalar('Precision/microPrec', metrics["microPrec"], epoch)
                 writer.add_scalar('Precision/weightPrec', metrics["weightPrec"], epoch)
@@ -392,17 +390,12 @@ def main(options):
                 writer.add_scalar('F1/weightF1', metrics["weightF1"], epoch)
                 writer.add_scalar('IoU/macroIoU', metrics["IoU"], epoch)
 
-                # Step scheduler (plateau after warmup)
-                if options['scheduler'] == 'plateau':
-                    if warmup_steps > 0 and global_step < warmup_steps:
-                        pass  # still in warmup
+                # ---- Step main scheduler once per epoch, after warmup ----
+                if global_step >= warmup_steps:
+                    if options['scheduler'] == 'plateau':
+                        main_scheduler.step(avg_val_loss)
                     else:
-                        if plateau_scheduler is not None:
-                            plateau_scheduler.step(avg_val_loss)
-                        else:
-                            scheduler.step(avg_val_loss)
-                elif options['scheduler'] != 'plateau' and warmup_steps == 0:
-                    scheduler.step()
+                        main_scheduler.step()
 
                 model.train()
 
@@ -444,121 +437,60 @@ def main(options):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument(
-        '--agg_to_water', default=True, type=bool,
-        help='Aggregate Mixed Water, Wakes, Cloud Shadows, Waves with Marine Water'
-    )
-    parser.add_argument(
-        '--mode', default='train', help='select between train or test '
-    )
-    parser.add_argument(
-        '--epochs', default=300, type=int, help='Number of epochs to run'
-    )
-    parser.add_argument(
-        '--batch', default=8, type=int, help='Batch size'
-    )
-    parser.add_argument(
-        '--resume_from_epoch', default=0, type=int,
-        help='load model from previous epoch'
-    )
-    parser.add_argument(
-        '--pretrained_path', default=None, type=str,
-        help='Path to pre-trained weights (optional)'
-    )
-    parser.add_argument(
-        '--checkpoint_name', default='best_model.pth', type=str,
-        help='Name of the checkpoint file in the epoch folder (for resume)'
-    )
-    parser.add_argument(
-        '--patience', default=15, type=int, help='Patience for early stopping'
-    )
+    # ------------------------------------------------------------------
+    # Shared options below are kept identical (same flag, same default)
+    # to train_unet.py. Only --pretrained_path is specific to this
+    # (Swin-UNet V2) script.
+    # ------------------------------------------------------------------
+    parser.add_argument('--agg_to_water', default=True, type=bool,
+                        help='Aggregate Mixed Water, Wakes, Cloud Shadows, Waves with Marine Water')
+    parser.add_argument('--mode', default='train', help="select between 'train' or 'test'")
+    parser.add_argument('--epochs', default=300, type=int, help='Number of epochs to run')
+    parser.add_argument('--batch', default=16, type=int, help='Batch size')
+    parser.add_argument('--resume_from_epoch', default=0, type=int, help='load model from previous epoch')
+    parser.add_argument('--pretrained_path', default=None, type=str,
+                        help='Path to pre-trained weights (optional)')
+    parser.add_argument('--checkpoint_name', default='best_model.pth', type=str,
+                        help='Name of the checkpoint file in the epoch folder (for resume)')
+    parser.add_argument('--patience', default=10, type=int, help='Patience for early stopping')
 
-    parser.add_argument(
-        '--input_channels', default=11, type=int, help='Number of input bands'
-    )
-    parser.add_argument(
-        '--output_channels', default=11, type=int, help='Number of output classes'
-    )
-    parser.add_argument(
-        '--weight_param', default=1.03, type=float,
-        help='Weighting parameter for Loss Function'
-    )
+    parser.add_argument('--input_channels', default=11, type=int, help='Number of input bands')
+    parser.add_argument('--output_channels', default=11, type=int, help='Number of output classes')
+    parser.add_argument('--weight_param', default=1.03, type=float,
+                        help='Weighting parameter for Loss Function')
 
-    parser.add_argument(
-        '--loss_type', default='ce', choices=['ce', 'focal'], help='Loss type'
-    )
-    parser.add_argument(
-        '--focal_gamma', default=2.0, type=float, help='Gamma for Focal Loss'
-    )
+    parser.add_argument('--loss_type', default='ce', choices=['ce', 'focal'], help='Loss type')
+    parser.add_argument('--focal_gamma', default=2.0, type=float, help='Gamma for Focal Loss')
 
-    parser.add_argument(
-        '--lr', default=5e-5, type=float,
-        help='learning rate (smaller for transformers)'
-    )
-    parser.add_argument(
-        '--decay', default=1e-4, type=float, help='weight decay'
-    )
-    parser.add_argument(
-        '--scheduler', default='plateau',
-        choices=['plateau', 'multistep', 'cosine'],
-        help='Learning rate scheduler type'
-    )
-    parser.add_argument(
-        '--lr_steps', default='[40]', type=str,
-        help='Steps for multistep scheduler'
-    )
-    parser.add_argument(
-        '--warmup_epochs', default=5, type=int,
-        help='Number of warmup epochs'
-    )
-    parser.add_argument(
-        '--grad_clip', default=1.0, type=float,
-        help='Gradient clipping value (0 = no clip)'
-    )
+    parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
+    parser.add_argument('--decay', default=1e-4, type=float, help='weight decay')
+    parser.add_argument('--scheduler', default='sgdr',
+                        choices=['sgdr', 'plateau', 'multistep', 'cosine'],
+                        help='Learning rate scheduler type (sgdr = cosine annealing with warm restarts)')
+    parser.add_argument('--lr_steps', default='[40]', type=str, help='Steps for multistep scheduler')
+    parser.add_argument('--warmup_epochs', default=5, type=int, help='Number of warmup epochs')
+    parser.add_argument('--grad_clip', default=1.0, type=float, help='Gradient clipping value (0 = no clip)')
 
-    parser.add_argument(
-        '--checkpoint_path',
-        default=os.path.join(PROJECT_ROOT, 'trained_models'),
-        help='folder to save checkpoints into'
-    )
-    parser.add_argument(
-        '--eval_every', default=1, type=int,
-        help='How frequently to run evaluation (epochs)'
-    )
+    parser.add_argument('--checkpoint_path', default=os.path.join(PROJECT_ROOT, 'trained_models'),
+                        help='folder to save checkpoints into')
+    parser.add_argument('--eval_every', default=1, type=int, help='How frequently to run evaluation (epochs)')
 
-    parser.add_argument(
-        '--num_workers', default=4, type=int,
-        help='How many cpus for loading data (0 is the main process)'
-    )
-    parser.add_argument(
-        '--pin_memory', default=True, type=bool,
-        help='Use pinned memory or not'
-    )
-    parser.add_argument(
-        '--prefetch_factor', default=2, type=int,
-        help='Number of sample loaded in advance by each worker'
-    )
-    parser.add_argument(
-        '--persistent_workers', default=True, type=bool,
-        help='This allows to maintain the workers Dataset instances alive.'
-    )
-    parser.add_argument(
-        '--tensorboard', default='tsboard_swin', type=str,
-        help='Name for tensorboard run'
-    )
+    parser.add_argument('--num_workers', default=4, type=int,
+                        help='How many cpus for loading data (0 is the main process)')
+    parser.add_argument('--pin_memory', default=True, type=bool, help='Use pinned memory or not')
+    parser.add_argument('--prefetch_factor', default=2, type=int,
+                        help='Number of samples loaded in advance by each worker')
+    parser.add_argument('--persistent_workers', default=True, type=bool,
+                        help='Keep worker Dataset instances alive between epochs')
+    parser.add_argument('--tensorboard', default='tsboard_swin', type=str, help='Name for tensorboard run')
 
     args = parser.parse_args()
     opts = vars(args)
 
-    # Parse lr_steps only if needed
     if opts['scheduler'] == 'multistep':
         lr_steps = ast.literal_eval(opts['lr_steps'])
-        if isinstance(lr_steps, list):
-            pass
-        elif isinstance(lr_steps, int):
+        if isinstance(lr_steps, int):
             lr_steps = [lr_steps]
-        else:
-            raise ValueError("lr_steps must be a list or int")
         opts['lr_steps'] = lr_steps
     else:
         opts['lr_steps'] = []

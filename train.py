@@ -6,7 +6,12 @@ This script has been aligned with train_with_swin_unetv2.py so that both
 models are trained under an IDENTICAL protocol (epochs, batch size,
 optimizer, weight decay, warmup, LR schedule, gradient clipping, early
 stopping, loss weighting, and data-loading settings). Only architecture-
+<<<<<<< HEAD
 specific options differ between the two scripts.
+=======
+specific options (--hidden_channels here; --pretrained_path for the
+transformer) differ between the two scripts.
+>>>>>>> 995b9e703a0e2e447b1e575d0134cce62bd334aa
 
 Author: Ioannis Kakogeorgiou (original) / aligned protocol, 2026
 Email: gkakogeorgiou@gmail.com
@@ -38,6 +43,12 @@ PROJECT_ROOT = up(os.path.abspath(__file__))
 sys.path.append(PROJECT_ROOT)
 
 from unet import UNet
+<<<<<<< HEAD
+=======
+# NOTE: dataloader.py exports BANDS_MEAN / BANDS_STD / CLASS_DISTR (uppercase).
+# The previous version of this script imported lowercase names that do not
+# exist in dataloader.py and would raise an ImportError; fixed here.
+>>>>>>> 995b9e703a0e2e447b1e575d0134cce62bd334aa
 from dataloader import (
     GenDEBRIS, BANDS_MEAN, BANDS_STD,
     RandomRotationTransform, gen_weights, CLASS_DISTR,
@@ -212,14 +223,24 @@ def main(options):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ------------------------------------------------------------------
+<<<<<<< HEAD
     # Model with backbone support
+=======
+    # Model. NOTE: hidden_channels=16 gives an ~0.8M-parameter U-Net,
+    # roughly 33x smaller than the default Swin-UNet V2 (~27.7M params).
+    # For a capacity-matched comparison, pass --hidden_channels 64
+    # (~13.4M params, close to Swin-UNet V2 at --embed_dim 64, ~12.7M).
+>>>>>>> 995b9e703a0e2e447b1e575d0134cce62bd334aa
     # ------------------------------------------------------------------
     model = UNet(
         input_bands=options['input_channels'],
         output_classes=options['output_channels'],
         hidden_channels=options['hidden_channels'],
+<<<<<<< HEAD
         backbone=options['backbone'],
         freeze_backbone=options['freeze_backbone'],
+=======
+>>>>>>> 995b9e703a0e2e447b1e575d0134cce62bd334aa
     )
     model.to(device)
 
@@ -447,6 +468,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--input_channels', default=11, type=int, help='Number of input bands')
     parser.add_argument('--output_channels', default=11, type=int, help='Number of output classes')
+<<<<<<< HEAD
     parser.add_argument('--hidden_channels', default=64, type=int,
                         help='U-Net base width (16 = ~0.8M params, 64 = ~13.4M params)')
     parser.add_argument('--backbone', default='none',
@@ -455,6 +477,10 @@ if __name__ == "__main__":
     parser.add_argument('--freeze_backbone', action='store_true', default=False,
                         help='Freeze the backbone weights (keep encoder frozen)')
 
+=======
+    parser.add_argument('--hidden_channels', default=16, type=int,
+                        help='U-Net base width (16 = ~0.8M params, 64 = ~13.4M params)')
+>>>>>>> 995b9e703a0e2e447b1e575d0134cce62bd334aa
     parser.add_argument('--weight_param', default=1.03, type=float,
                         help='Weighting parameter for Loss Function')
 
@@ -495,4 +521,8 @@ if __name__ == "__main__":
         options['lr_steps'] = []
 
     logging.info('parsed input parameters:\n%s', json.dumps(options, indent=2))
+<<<<<<< HEAD
     main(options)
+=======
+    main(options)
+>>>>>>> 995b9e703a0e2e447b1e575d0134cce62bd334aa

@@ -67,6 +67,7 @@ class Up(nn.Module):
         return self.conv(x)
 
 
+<<<<<<< HEAD
 # ----------------------------------------------------------------------
 # Backbone encoders
 # ----------------------------------------------------------------------
@@ -90,6 +91,36 @@ class ResNetEncoder(nn.Module):
             ('layer3', resnet.layer3),
             ('layer4', resnet.layer4),
         ]))
+=======
+class UNet(nn.Module):
+    
+    def __init__(self, input_bands = 11, output_classes = 11, hidden_channels=64):
+        super(UNet, self).__init__()
+        
+        # Initial Convolution Layer
+        self.inc = nn.Sequential(
+            nn.Conv2d(input_bands, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True))
+        
+        # Contracting Path
+        self.down1 = Down(hidden_channels, 2*hidden_channels)
+        self.down2 = Down(2*hidden_channels, 4*hidden_channels)
+        self.down3 = Down(4*hidden_channels, 8*hidden_channels)
+        self.down4 = Down(8*hidden_channels, 8*hidden_channels)
+        
+        # Expanding Path
+        self.up1 = Up(16*hidden_channels, 4*hidden_channels)
+        self.up2 = Up(8*hidden_channels, 2*hidden_channels)
+        self.up3 = Up(4*hidden_channels, hidden_channels)
+        self.up4 = Up(2*hidden_channels, hidden_channels)
+        
+        # Output Convolution Layer
+        self.outc = nn.Conv2d(hidden_channels, output_classes, kernel_size=1)
+>>>>>>> 995b9e703a0e2e447b1e575d0134cce62bd334aa
 
     def forward(self, x):
         features = []
