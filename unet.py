@@ -67,7 +67,6 @@ class Up(nn.Module):
         return self.conv(x)
 
 
-<<<<<<< HEAD
 # ----------------------------------------------------------------------
 # Backbone encoders
 # ----------------------------------------------------------------------
@@ -91,7 +90,6 @@ class ResNetEncoder(nn.Module):
             ('layer3', resnet.layer3),
             ('layer4', resnet.layer4),
         ]))
-=======
 class UNet(nn.Module):
     
     def __init__(self, input_bands = 11, output_classes = 11, hidden_channels=64):
@@ -120,7 +118,6 @@ class UNet(nn.Module):
         
         # Output Convolution Layer
         self.outc = nn.Conv2d(hidden_channels, output_classes, kernel_size=1)
->>>>>>> 995b9e703a0e2e447b1e575d0134cce62bd334aa
 
     def forward(self, x):
         features = []
