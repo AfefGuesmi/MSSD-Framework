@@ -446,7 +446,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--input_channels', default=11, type=int, help='Number of input bands')
     parser.add_argument('--output_channels', default=11, type=int, help='Number of output classes')
-    parser.add_argument('--hidden_channels', default=16, type=int,
+    parser.add_argument('--hidden_channels', default=64, type=int,
                         help='U-Net base width (16 = ~0.8M params, 64 = ~13.4M params)')
     parser.add_argument('--backbone', default='none',
                         choices=['none', 'resnet18', 'mobilenetv2', 'efficientnetv2'],
