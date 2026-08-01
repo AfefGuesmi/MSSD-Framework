@@ -60,7 +60,7 @@ class Up(nn.Module):
 
 class UNet(nn.Module):
     
-    def __init__(self, input_bands = 11, output_classes = 11, hidden_channels=16):
+    def __init__(self, input_bands = 11, output_classes = 11, hidden_channels=64):
         super(UNet, self).__init__()
         
         # Initial Convolution Layer
