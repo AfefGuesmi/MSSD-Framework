@@ -147,6 +147,60 @@ class FocalLoss(nn.Module):
         return focal_loss
 
 
+class DiceLoss(nn.Module):
+    """
+    Soft Dice loss for multi-class segmentation, optionally class-weighted
+    with the same weight vector used for CrossEntropyLoss (--weight_param).
+
+    Unlike raw IoU/Jaccard loss, Dice's gradient is gentler on
+    near-empty-overlap (rare-class) pixels, which tends to train more
+    stably than Focal loss under MARIDA's severe imbalance -- Focal
+    (gamma=2) measurably hurt Macro F1 in our ablation for both the
+    baseline and residual-fusion variants.
+    """
+
+    def __init__(self, num_classes, weight=None, ignore_index=-1, smooth=1.0):
+        super().__init__()
+        self.num_classes = num_classes
+        self.weight = weight
+        self.ignore_index = ignore_index
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        probs = F.softmax(logits, dim=1)  # (B, C, H, W)
+
+        valid = (targets != self.ignore_index)
+        targets_clamped = targets.clone()
+        targets_clamped[~valid] = 0  # placeholder class, masked out below
+        one_hot = F.one_hot(targets_clamped, self.num_classes).permute(0, 3, 1, 2).float()
+
+        valid = valid.unsqueeze(1).float()
+        probs = probs * valid
+        one_hot = one_hot * valid
+
+        dims = (0, 2, 3)
+        intersection = (probs * one_hot).sum(dims)
+        union = probs.sum(dims) + one_hot.sum(dims)
+        dice_per_class = (2 * intersection + self.smooth) / (union + self.smooth)
+
+        if self.weight is not None:
+            return 1 - (dice_per_class * self.weight).sum() / self.weight.sum()
+        return 1 - dice_per_class.mean()
+
+
+class CEDiceLoss(nn.Module):
+    """Weighted sum of CrossEntropyLoss and DiceLoss: CE + dice_weight * Dice."""
+
+    def __init__(self, num_classes, weight=None, ignore_index=-1, dice_weight=0.5):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='mean', weight=weight)
+        self.dice = DiceLoss(num_classes, weight=weight, ignore_index=ignore_index)
+        self.dice_weight = dice_weight
+
+    def forward(self, logits, targets):
+        return self.ce(logits, targets) + self.dice_weight * self.dice(logits, targets)
+
+
 def build_scheduler(optimizer, options, steps_per_epoch):
     """
     Build a linear-warmup scheduler plus a main scheduler. Identical
@@ -339,6 +393,13 @@ def main(options):
     if options['loss_type'] == 'focal':
         criterion = FocalLoss(alpha=weight, gamma=options['focal_gamma'], ignore_index=-1, reduction='mean')
         logging.info("Using Focal Loss with gamma=%.2f", options['focal_gamma'])
+    elif options['loss_type'] == 'dice':
+        criterion = DiceLoss(num_classes=options['output_channels'], weight=weight, ignore_index=-1)
+        logging.info("Using Dice Loss")
+    elif options['loss_type'] == 'ce_dice':
+        criterion = CEDiceLoss(num_classes=options['output_channels'], weight=weight,
+                                ignore_index=-1, dice_weight=options['dice_weight'])
+        logging.info("Using CrossEntropy + %.2f * Dice Loss", options['dice_weight'])
     else:
         criterion = nn.CrossEntropyLoss(ignore_index=-1, reduction='mean', weight=weight)
         logging.info("Using CrossEntropy Loss")
@@ -580,8 +641,17 @@ if __name__ == "__main__":
     parser.add_argument('--weight_param', default=1.03, type=float,
                         help='Weighting parameter for Loss Function')
 
-    parser.add_argument('--loss_type', default='ce', choices=['ce', 'focal'], help='Loss type')
+    parser.add_argument('--loss_type', default='ce', choices=['ce', 'focal', 'dice', 'ce_dice'],
+                         help="Loss type: 'ce' (weighted cross-entropy, default), 'focal' "
+                              "(measurably hurts Macro F1 in our ablation -- kept for "
+                              "comparison), 'dice' (soft Dice only), or 'ce_dice' "
+                              "(CE + --dice_weight * Dice, generally the recommended one "
+                              "to try first: gentler gradient on rare-class pixels than "
+                              "Focal, more IoU-aligned than plain CE).")
     parser.add_argument('--focal_gamma', default=2.0, type=float, help='Gamma for Focal Loss')
+    parser.add_argument('--dice_weight', default=0.5, type=float,
+                         help="Weight of the Dice term when --loss_type ce_dice (loss = "
+                              "CE + dice_weight * Dice). Ignored for other loss types.")
 
     parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
     parser.add_argument('--decay', default=1e-4, type=float, help='weight decay')
