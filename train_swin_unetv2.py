@@ -52,7 +52,7 @@ sys.path.append(PROJECT_ROOT)
 from utils.config import Config
 from mssd_net import build_mssd_net, VARIANTS
 from dataloader import (
-    GenDEBRIS, BANDS_MEAN, BANDS_STD,
+    GenDEBRIS, BANDS_MEAN, BANDS_STD, DATASET_PATH,
     RandomRotationTransform, gen_weights, CLASS_DISTR
 )
 
@@ -190,21 +190,32 @@ def main(options):
     generator = torch.Generator()
     generator.manual_seed(0)
 
-    best_loss = float('inf')
+    best_score = float('-inf')
     early_stop_counter = 0
     patience = options['patience']
     writer = SummaryWriter(os.path.join(PROJECT_ROOT, 'logs', options['tensorboard']))
 
-    transform_train = transforms.Compose([
-        transforms.ToTensor(),
-        RandomRotationTransform([-90, 0, 90, 180]),
-        transforms.RandomHorizontalFlip()
-    ])
+    transform_steps = [transforms.ToTensor()]
+    if options['train_rotations']:
+        transform_steps.append(RandomRotationTransform(options['train_rotations']))
+    if options['train_hflip']:
+        transform_steps.append(transforms.RandomHorizontalFlip())
+    transform_train = transforms.Compose(transform_steps)
     transform_test = transforms.Compose([transforms.ToTensor()])
 
     standardization = transforms.Normalize(BANDS_MEAN, BANDS_STD)
 
     if options['mode'] == 'train':
+        splits_dir = os.path.join(DATASET_PATH, 'splits')
+        train_rois_raw = np.genfromtxt(os.path.join(splits_dir, 'train_X.txt'), dtype='str')
+        val_rois_raw = np.genfromtxt(os.path.join(splits_dir, 'val_X.txt'), dtype='str')
+
+        logging.info(
+            "Patches before augmentation - train: %d, val: %d",
+            len(train_rois_raw), len(val_rois_raw)
+        )
+        print(f"Patches before augmentation - train: {len(train_rois_raw)}, val: {len(val_rois_raw)}")
+
         train_dataset = GenDEBRIS(
             'train', transform=transform_train, standardization=standardization,
             agg_to_water=options['agg_to_water']
@@ -213,6 +224,12 @@ def main(options):
             'val', transform=transform_test, standardization=standardization,
             agg_to_water=options['agg_to_water']
         )
+
+        logging.info(
+            "Patches after augmentation - train: %d, val: %d",
+            len(train_dataset), len(val_dataset)
+        )
+        print(f"Patches after augmentation - train: {len(train_dataset)}, val: {len(val_dataset)}")
 
         train_loader = DataLoader(
             train_dataset,
@@ -410,14 +427,37 @@ def main(options):
                 metrics = Evaluation(np.array(y_pred), np.array(y_true))
 
                 logging.info(
-                    "Epoch %d - Train loss: %.4f - Val loss: %.4f",
-                    epoch, avg_train_loss, avg_val_loss
+                    "Epoch %d - Train loss: %.4f - Val loss: %.4f - Val macroF1: %.4f - Val mIoU: %.4f",
+                    epoch, avg_train_loss, avg_val_loss, metrics['macroF1'], metrics['IoU']
                 )
 
-                if avg_val_loss < best_loss:
-                    best_loss = avg_val_loss
+                # ---- Checkpoint-selection metric ----
+                # Weighted CE/focal loss keeps improving on majority classes
+                # (Sediment-Laden Water, Clouds, Turbid Water) long after the
+                # epoch with the best rare-class performance (Marine Debris,
+                # Foam) has passed. Selecting by val loss can therefore save
+                # a checkpoint that looks best on the training objective but
+                # is not the one that scores best on the metrics actually
+                # reported (Macro F1 / mIoU). Default to selecting by
+                # Macro F1; --select_metric val_loss restores the old
+                # loss-based behaviour for comparison.
+                if options['select_metric'] == 'macroF1':
+                    current_score = metrics['macroF1']
+                elif options['select_metric'] == 'mIoU':
+                    current_score = metrics['IoU']
+                else:  # 'val_loss' -- higher-is-better via negation, for a uniform comparison below
+                    current_score = -avg_val_loss
+
+                if current_score > best_score:
+                    best_score = current_score
                     early_stop_counter = 0
-                    logging.info("Best validation loss improved to: %.4f", best_loss)
+                    logging.info(
+                        "Best model improved (%s = %.4f, val loss = %.4f)",
+                        options['select_metric'],
+                        metrics['macroF1'] if options['select_metric'] == 'macroF1'
+                        else (metrics['IoU'] if options['select_metric'] == 'mIoU' else avg_val_loss),
+                        avg_val_loss,
+                    )
                     logging.info("Evaluation after epoch %d: %s", epoch, metrics)
 
                     save_dir = os.path.join(options['checkpoint_path'], str(epoch))
@@ -434,8 +474,8 @@ def main(options):
                 else:
                     early_stop_counter += 1
                     logging.info(
-                        "Validation loss did not improve. Early stop counter: %d/%d",
-                        early_stop_counter, patience
+                        "%s did not improve. Early stop counter: %d/%d",
+                        options['select_metric'], early_stop_counter, patience
                     )
                     if early_stop_counter >= patience:
                         logging.info('Early stopping triggered after epoch %d.', epoch)
@@ -529,6 +569,11 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint_name', default='best_model.pth', type=str,
                         help='Name of the checkpoint file in the epoch folder (for resume)')
     parser.add_argument('--patience', default=10, type=int, help='Patience for early stopping')
+    parser.add_argument('--select_metric', default='macroF1', choices=['macroF1', 'mIoU', 'val_loss'],
+                        help="Metric used to pick the checkpoint to save each eval step. "
+                             "'macroF1' (default) and 'mIoU' select by validation performance "
+                             "on the metrics actually reported, which better tracks rare-class "
+                             "quality under MARIDA's class imbalance than 'val_loss'.")
 
     parser.add_argument('--input_channels', default=11, type=int, help='Number of input bands')
     parser.add_argument('--output_channels', default=11, type=int, help='Number of output classes')
@@ -546,6 +591,14 @@ if __name__ == "__main__":
     parser.add_argument('--lr_steps', default='[40]', type=str, help='Steps for multistep scheduler')
     parser.add_argument('--warmup_epochs', default=5, type=int, help='Number of warmup epochs')
     parser.add_argument('--grad_clip', default=1.0, type=float, help='Gradient clipping value (0 = no clip)')
+
+    parser.add_argument('--train_rotations', default='[-90,0,90,180]', type=str,
+                        help='Random-rotation augmentation angles for training, as a '
+                             'Python list literal (each must be a multiple of 90, since '
+                             'GenDEBRIS rounds the rotated mask back to integer class '
+                             'labels). Pass "[]" or "[0]" to disable rotation augmentation.')
+    parser.add_argument('--train_hflip', default=True, type=bool,
+                        help='Apply random horizontal flip augmentation during training.')
 
     parser.add_argument('--checkpoint_path', default=os.path.join(PROJECT_ROOT, 'trained_models'),
                         help='base folder to save checkpoints into (variant name is appended automatically)')
@@ -571,6 +624,17 @@ if __name__ == "__main__":
         opts['lr_steps'] = lr_steps
     else:
         opts['lr_steps'] = []
+
+    train_rotations = ast.literal_eval(opts['train_rotations'])
+    if isinstance(train_rotations, int):
+        train_rotations = [train_rotations]
+    for angle in train_rotations:
+        if angle % 90 != 0:
+            raise ValueError(
+                f"--train_rotations angles must be multiples of 90 (GenDEBRIS rounds "
+                f"the rotated mask back to integer class labels); got {angle}"
+            )
+    opts['train_rotations'] = train_rotations
 
     # Namespace checkpoints and tensorboard logs by variant, so running the
     # ablation study (baseline, +dilated, +dilated+attention, full, ...)
