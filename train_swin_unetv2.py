@@ -270,13 +270,24 @@ def main(options):
         )
         print(f"Patches before augmentation - train: {len(train_rois_raw)}, val: {len(val_rois_raw)}")
 
+        # Parsed once, reused by both copy-paste augmentation (GenDEBRIS)
+        # and rare-class oversampling (WeightedRandomSampler) below, so the
+        # two augmentations always target the same class list.
+        rare_classes = [int(c) for c in options['rare_classes'].split(',') if c.strip() != '']
+
         train_dataset = GenDEBRIS(
             'train', transform=transform_train, standardization=standardization,
-            agg_to_water=options['agg_to_water']
+            agg_to_water=options['agg_to_water'],
+            rare_classes=rare_classes,
+            copy_paste_prob=options['copy_paste_prob'],
+            spectral_jitter_prob=options['spectral_jitter_prob'],
+            spectral_jitter_strength=options['spectral_jitter_strength'],
         )
         val_dataset = GenDEBRIS(
             'val', transform=transform_test, standardization=standardization,
             agg_to_water=options['agg_to_water']
+            # No rare_classes / copy_paste_prob / spectral_jitter_prob here:
+            # validation must stay deterministic and unaugmented.
         )
 
         logging.info(
@@ -295,7 +306,6 @@ def main(options):
         # actually sees during training rather than just how much a
         # mistake on it costs.
         if options['oversample_rare']:
-            rare_classes = [int(c) for c in options['rare_classes'].split(',') if c.strip() != '']
             sample_weights = train_dataset.compute_sample_weights(
                 rare_classes, boost=options['oversample_boost']
             )
@@ -709,6 +719,24 @@ if __name__ == "__main__":
                               "present is drawn ~(1+boost)x as often as a patch with none; a "
                               "patch with two rare classes present is drawn ~(1+2*boost)x as "
                               "often, and so on. Higher = more aggressive oversampling.")
+
+    parser.add_argument('--copy_paste_prob', default=0.0, type=float,
+                         help="Probability, per training patch, of pasting rare-class pixels "
+                              "(--rare_classes) from a randomly chosen donor patch onto the "
+                              "current one at the same spatial positions -- image bands and "
+                              "mask label are copied together, so they stay consistent. "
+                              "Multiplies rare-class training signal on top of (not instead "
+                              "of) --oversample_rare. 0 (default) disables it. Train split "
+                              "only; val/test are never augmented this way.")
+    parser.add_argument('--spectral_jitter_prob', default=0.0, type=float,
+                         help="Probability, per training patch, of multiplying each Sentinel-2 "
+                              "band by an independent random factor close to 1.0 (see "
+                              "--spectral_jitter_strength), simulating sensor/atmospheric "
+                              "variation. 0 (default) disables it. Train split only.")
+    parser.add_argument('--spectral_jitter_strength', default=0.05, type=float,
+                         help="Each band's spectral-jitter factor is drawn uniformly from "
+                              "[1 - strength, 1 + strength]. Only used when "
+                              "--spectral_jitter_prob > 0.")
 
     parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
     parser.add_argument('--decay', default=1e-4, type=float, help='weight decay')

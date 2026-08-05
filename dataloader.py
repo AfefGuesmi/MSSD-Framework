@@ -7,6 +7,7 @@ Email: gkakogeorgiou@gmail.com
 Python Version: 3.7.10
 """
 
+import logging
 import os
 import random
 from os.path import dirname as up
@@ -57,10 +58,28 @@ class GenDEBRIS(Dataset):
         standardization (callable, optional): Normalization using band stats.
         path (str): Root directory of the dataset.
         agg_to_water (bool): If True, merge classes 12-15 into Marine Water.
+        rare_classes (list[int], optional): 0-indexed class IDs (in the same
+            aggregated label space __getitem__ returns) used by both
+            copy-paste augmentation and compute_sample_weights().
+        copy_paste_prob (float): Probability, per __getitem__ call, of
+            pasting rare-class pixels from a randomly chosen donor patch
+            (one known to contain at least one rare class) onto the
+            current patch at the same spatial positions. 0 disables it.
+            Intended for the train split only -- leave at 0 for val/test
+            so evaluation stays deterministic and unaugmented.
+        spectral_jitter_prob (float): Probability, per __getitem__ call, of
+            multiplying each band by an independent random factor close to
+            1.0 (see spectral_jitter_strength), simulating sensor/
+            atmospheric variation. 0 disables it. Train split only.
+        spectral_jitter_strength (float): Each band's multiplicative jitter
+            factor is drawn uniformly from
+            [1 - spectral_jitter_strength, 1 + spectral_jitter_strength].
     """
 
     def __init__(self, mode='train', transform=None, standardization=None,
-                 path=DATASET_PATH, agg_to_water=True):
+                 path=DATASET_PATH, agg_to_water=True, rare_classes=None,
+                 copy_paste_prob=0.0, spectral_jitter_prob=0.0,
+                 spectral_jitter_strength=0.05):
         super().__init__()
 
         split_file = os.path.join(path, 'splits', f'{mode}_X.txt')
@@ -109,6 +128,83 @@ class GenDEBRIS(Dataset):
         self.path = path
         self.agg_to_water = agg_to_water
 
+        self.rare_classes = list(rare_classes) if rare_classes else []
+        self.copy_paste_prob = copy_paste_prob
+        self.spectral_jitter_prob = spectral_jitter_prob
+        self.spectral_jitter_strength = spectral_jitter_strength
+
+        self._rare_class_patch_indices = []
+        if self.copy_paste_prob > 0:
+            if not self.rare_classes:
+                logging.warning(
+                    "GenDEBRIS(%s): copy_paste_prob=%.2f but rare_classes is empty -- "
+                    "copy-paste augmentation will be a no-op.", mode, self.copy_paste_prob
+                )
+            else:
+                self._rare_class_patch_indices = self._index_rare_class_patches()
+                if not self._rare_class_patch_indices:
+                    logging.warning(
+                        "GenDEBRIS(%s): no patches contain any of rare_classes=%s -- "
+                        "copy-paste augmentation will be a no-op.", mode, self.rare_classes
+                    )
+                else:
+                    logging.info(
+                        "GenDEBRIS(%s): copy-paste augmentation enabled (prob=%.2f), "
+                        "%d/%d patches available as donors for rare_classes=%s.",
+                        mode, self.copy_paste_prob, len(self._rare_class_patch_indices),
+                        len(self.masks), self.rare_classes
+                    )
+
+    def _index_rare_class_patches(self):
+        """Indices of patches containing at least one rare class, for use as copy-paste donors."""
+        return [i for i, m in enumerate(self.masks) if np.isin(m, self.rare_classes).any()]
+
+    def _copy_paste_rare_classes(self, img, mask):
+        """
+        Paste rare-class pixels from a randomly chosen donor patch (one
+        known to contain at least one rare class) onto (img, mask), at the
+        same spatial positions. Image bands and mask label are copied
+        together at each pasted pixel, so the two stay consistent -- this
+        directly multiplies how often the model sees rare classes during
+        training, on top of (not instead of) sample-level oversampling.
+
+        Args:
+            img (np.ndarray): (H, W, C) image, already NaN-imputed.
+            mask (np.ndarray): (H, W) integer class labels.
+
+        Returns:
+            (np.ndarray, np.ndarray): augmented (img, mask), same shapes.
+        """
+        donor_idx = random.choice(self._rare_class_patch_indices)
+        donor_img = np.moveaxis(self.images[donor_idx], 0, -1).astype(np.float32)
+        donor_mask = self.masks[donor_idx]
+
+        # Impute the donor's NaNs the same way __getitem__ does for the main image.
+        donor_nan_mask = np.isnan(donor_img)
+        donor_img[donor_nan_mask] = self.impute_nan[donor_nan_mask]
+
+        paste_mask = np.isin(donor_mask, self.rare_classes)
+        if not paste_mask.any():
+            return img, mask  # shouldn't happen given _rare_class_patch_indices, but stay safe
+
+        img = img.copy()
+        mask = mask.copy()
+        img[paste_mask] = donor_img[paste_mask]
+        mask[paste_mask] = donor_mask[paste_mask]
+        return img, mask
+
+    def _spectral_jitter(self, img):
+        """
+        Multiply each band of a (C, H, W) tensor by an independent random
+        factor in [1 - spectral_jitter_strength, 1 + spectral_jitter_strength],
+        simulating realistic Sentinel-2 sensor/atmospheric variation. Cheap
+        regularisation against overfitting exact band statistics on a
+        694-patch training set.
+        """
+        num_bands = img.shape[0]
+        factors = 1.0 + (torch.rand(num_bands, 1, 1) * 2 - 1) * self.spectral_jitter_strength
+        return img * factors
+
     def __len__(self):
         return len(self.masks)
 
@@ -156,6 +252,13 @@ class GenDEBRIS(Dataset):
         nan_mask = np.isnan(img)
         img[nan_mask] = self.impute_nan[nan_mask]
 
+        # ---- Copy-paste rare-class augmentation ----
+        # Runs before the geometric transform below, so the pasted region
+        # also gets rotated/flipped consistently along with the rest of
+        # the patch.
+        if self._rare_class_patch_indices and random.random() < self.copy_paste_prob:
+            img, mask = self._copy_paste_rare_classes(img, mask)
+
         if self.transform is not None:
             # Concatenate mask as extra channel to apply same transform
             mask = mask[..., np.newaxis]
@@ -169,6 +272,12 @@ class GenDEBRIS(Dataset):
             # Convert to tensor if no transform
             img = torch.from_numpy(np.moveaxis(img, -1, 0))  # back to (C, H, W)
             mask = torch.from_numpy(mask)
+
+        # ---- Spectral jitter ----
+        # Image channels only -- applied after the mask has already been
+        # split back out, so the (integer) class labels are never touched.
+        if self.spectral_jitter_prob > 0 and random.random() < self.spectral_jitter_prob:
+            img = self._spectral_jitter(img)
 
         if self.standardization is not None:
             img = self.standardization(img)
