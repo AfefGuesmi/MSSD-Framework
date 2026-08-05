@@ -201,6 +201,42 @@ class CEDiceLoss(nn.Module):
         return self.ce(logits, targets) + self.dice_weight * self.dice(logits, targets)
 
 
+def build_param_groups(model, base_lr, encoder_lr_mult, weight_decay):
+    """
+    Split model parameters into two LR groups: the ImageNet-pretrained
+    encoder (patch_embed + layers -- see MSSDNet.load_pretrained) gets
+    base_lr * encoder_lr_mult, everything else (decoder, MSSD modules,
+    and the randomly-initialized relative-position-bias tensors that
+    live inside `layers` but have no ImageNet counterpart) gets base_lr.
+
+    This targets a real, logged asymmetry: MSSDNet.load_pretrained()
+    reports ~99 tensors loaded from ImageNet but ~188 left at random
+    init, so part of the network starts pretrained and part starts from
+    scratch. Sharing one LR across both is a poor fit for that -- a
+    lower LR protects the pretrained features from being overwritten
+    too fast early in training, while the from-scratch parts can move
+    at the full rate.
+
+    Returns:
+        (list[dict], int, int): param groups for torch.optim.Adam, plus
+        the encoder/other parameter counts (for logging).
+    """
+    encoder_params, other_params = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith('patch_embed.') or name.startswith('layers.'):
+            encoder_params.append(param)
+        else:
+            other_params.append(param)
+
+    groups = [
+        {'params': encoder_params, 'lr': base_lr * encoder_lr_mult, 'weight_decay': weight_decay},
+        {'params': other_params, 'lr': base_lr, 'weight_decay': weight_decay},
+    ]
+    return groups, len(encoder_params), len(other_params)
+
+
 def build_scheduler(optimizer, options, steps_per_epoch):
     """
     Build a linear-warmup scheduler plus a main scheduler. Identical
@@ -450,7 +486,18 @@ def main(options):
         criterion = nn.CrossEntropyLoss(ignore_index=-1, reduction='mean', weight=weight)
         logging.info("Using CrossEntropy Loss")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=options['lr'], weight_decay=options['decay'])
+    if options['encoder_lr_mult'] != 1.0:
+        param_groups, n_encoder, n_other = build_param_groups(
+            model, options['lr'], options['encoder_lr_mult'], options['decay']
+        )
+        optimizer = torch.optim.Adam(param_groups)
+        logging.info(
+            "Differential LR enabled: %d pretrained-encoder params at lr=%.2e, "
+            "%d other params (decoder/MSSD/random-init) at lr=%.2e",
+            n_encoder, options['lr'] * options['encoder_lr_mult'], n_other, options['lr']
+        )
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=options['lr'], weight_decay=options['decay'])
 
     # ---------- Learning-rate schedule: linear warmup + main schedule ----------
     warmup_scheduler, main_scheduler, warmup_steps = build_scheduler(
@@ -739,6 +786,13 @@ if __name__ == "__main__":
                               "--spectral_jitter_prob > 0.")
 
     parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
+    parser.add_argument('--encoder_lr_mult', default=1.0, type=float,
+                         help="Multiplier applied to --lr for the ImageNet-pretrained encoder "
+                              "params (patch_embed + layers.*); everything else (decoder, MSSD "
+                              "modules, and the randomly-initialized relative-position-bias "
+                              "tensors) uses --lr directly. Default 1.0 = single shared LR "
+                              "(previous behavior, unchanged). Try e.g. 0.1 so the pretrained "
+                              "ImageNet features move slower than the from-scratch parts.")
     parser.add_argument('--decay', default=1e-4, type=float, help='weight decay')
     parser.add_argument('--scheduler', default='sgdr',
                         choices=['sgdr', 'plateau', 'multistep', 'cosine'],
