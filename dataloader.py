@@ -116,6 +116,35 @@ class GenDEBRIS(Dataset):
         """Return the ROI identifiers."""
         return self.rois
 
+    def compute_sample_weights(self, rare_classes, boost=5.0):
+        """
+        Compute a per-patch sampling weight, for use with
+        torch.utils.data.WeightedRandomSampler, so that patches containing
+        rare classes get drawn more often during training than patches
+        that don't -- on top of (not instead of) any loss-level class
+        weighting.
+
+        Args:
+            rare_classes (list[int]): 0-indexed class IDs (matching the
+                values found in self.masks, i.e. in the same aggregated
+                label space __getitem__ returns) considered rare/
+                underperforming and worth oversampling.
+            boost (float): extra weight added per rare class present in a
+                patch. A patch with none of the rare classes present gets
+                the base weight of 1.0; a patch with one rare class
+                present gets 1.0 + boost; a patch with two gets
+                1.0 + 2*boost, and so on.
+
+        Returns:
+            list[float]: one weight per patch, in the same order as
+                self.masks / self.images (i.e. dataset index order).
+        """
+        weights = []
+        for mask in self.masks:
+            n_rare_present = sum(1 for c in rare_classes if np.any(mask == c))
+            weights.append(1.0 + boost * n_rare_present)
+        return weights
+
     def __getitem__(self, index):
         img = self.images[index].copy()
         mask = self.masks[index].copy()

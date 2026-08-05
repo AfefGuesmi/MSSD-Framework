@@ -42,7 +42,7 @@ from torch.optim.lr_scheduler import (
     LinearLR, ReduceLROnPlateau, CosineAnnealingLR,
     CosineAnnealingWarmRestarts, MultiStepLR,
 )
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -285,17 +285,53 @@ def main(options):
         )
         print(f"Patches after augmentation - train: {len(train_dataset)}, val: {len(val_dataset)}")
 
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=options['batch'],
-            shuffle=True,
-            num_workers=options['num_workers'],
-            pin_memory=options['pin_memory'],
-            prefetch_factor=options['prefetch_factor'],
-            persistent_workers=options['persistent_workers'],
-            worker_init_fn=seed_worker,
-            generator=generator
-        )
+        # ---- Rare-class oversampling ----
+        # Plain shuffle=True samples every patch with equal probability.
+        # Most patches barely contain Marine Debris/Sparse Sargassum/Foam
+        # pixels, so the model sees very little of them per epoch even
+        # though the loss weighting tries to compensate after the fact.
+        # A WeightedRandomSampler instead makes patches that DO contain a
+        # rare class more likely to be drawn, changing what the model
+        # actually sees during training rather than just how much a
+        # mistake on it costs.
+        if options['oversample_rare']:
+            rare_classes = [int(c) for c in options['rare_classes'].split(',') if c.strip() != '']
+            sample_weights = train_dataset.compute_sample_weights(
+                rare_classes, boost=options['oversample_boost']
+            )
+            logging.info(
+                "Rare-class oversampling enabled for classes %s (boost=%.1f per class present). "
+                "Per-patch weight range: [%.2f, %.2f]",
+                rare_classes, options['oversample_boost'],
+                min(sample_weights), max(sample_weights)
+            )
+            sampler = WeightedRandomSampler(
+                weights=sample_weights, num_samples=len(sample_weights), replacement=True,
+                generator=generator
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=options['batch'],
+                sampler=sampler,  # sampler and shuffle are mutually exclusive in DataLoader
+                num_workers=options['num_workers'],
+                pin_memory=options['pin_memory'],
+                prefetch_factor=options['prefetch_factor'],
+                persistent_workers=options['persistent_workers'],
+                worker_init_fn=seed_worker,
+                generator=generator
+            )
+        else:
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=options['batch'],
+                shuffle=True,
+                num_workers=options['num_workers'],
+                pin_memory=options['pin_memory'],
+                prefetch_factor=options['prefetch_factor'],
+                persistent_workers=options['persistent_workers'],
+                worker_init_fn=seed_worker,
+                generator=generator
+            )
         val_loader = DataLoader(
             val_dataset,
             batch_size=options['batch'],
@@ -652,6 +688,27 @@ if __name__ == "__main__":
     parser.add_argument('--dice_weight', default=0.5, type=float,
                          help="Weight of the Dice term when --loss_type ce_dice (loss = "
                               "CE + dice_weight * Dice). Ignored for other loss types.")
+
+    parser.add_argument('--oversample_rare', default=True, type=bool,
+                         help="Use a WeightedRandomSampler that oversamples training patches "
+                              "containing rare classes, instead of plain uniform shuffling. "
+                              "Changes what the model actually sees during training, on top "
+                              "of (not instead of) loss-based class weighting.")
+    parser.add_argument('--rare_classes', default='0,2,3,8', type=str,
+                         help="Comma-separated 0-indexed class IDs to oversample, in the "
+                              "aggregated 11-class label space used by the masks (as returned "
+                              "by GenDEBRIS, i.e. after --agg_to_water). Default '0,2,3,8' "
+                              "assumes the confusion-matrix column order from your logs: "
+                              "0=Marine Debris, 2=Sparse Sargassum, 3=Natural Organic Material, "
+                              "8=Foam. VERIFY this against your actual label mapping before "
+                              "relying on it -- if it's wrong, oversampling will boost the "
+                              "wrong patches.")
+    parser.add_argument('--oversample_boost', default=5.0, type=float,
+                         help="Extra sampling weight added per rare class present in a patch "
+                              "(on top of a base weight of 1.0). A patch with one rare class "
+                              "present is drawn ~(1+boost)x as often as a patch with none; a "
+                              "patch with two rare classes present is drawn ~(1+2*boost)x as "
+                              "often, and so on. Higher = more aggressive oversampling.")
 
     parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
     parser.add_argument('--decay', default=1e-4, type=float, help='weight decay')
