@@ -52,7 +52,7 @@ sys.path.append(os.path.join(PROJECT_ROOT, 'utils'))
 from utils.config import Config
 from mssd_net import build_mssd_net, VARIANTS
 from unet import UNet
-from dataloader import GenDEBRIS, BANDS_MEAN, BANDS_STD, DATASET_PATH, SPECTRAL_INDEX_NAMES
+from dataloader import GenDEBRIS, BANDS_MEAN, BANDS_STD, DATASET_PATH, SPECTRAL_INDEX_NAMES, TEXTURE_FEATURE_NAMES
 from utils.metrics import Evaluation
 
 try:
@@ -328,7 +328,8 @@ def main(options):
     dataset_test = GenDEBRIS('test', transform=transform_test,
                               standardization=standardization,
                               agg_to_water=options['agg_to_water'],
-                              use_spectral_indices=options['use_spectral_indices'])
+                              use_spectral_indices=options['use_spectral_indices'],
+                              use_texture_features=options['use_texture_features'])
     test_loader = DataLoader(dataset_test, batch_size=options['batch'], shuffle=False)
 
     class_names = list(ALL_LABELS)
@@ -516,10 +517,16 @@ if __name__ == "__main__":
     parser.add_argument('--output_channels', default=11, type=int, help='Number of output classes')
     parser.add_argument('--use_spectral_indices', default=False, type=bool,
                          help='Must match the --use_spectral_indices setting the checkpoint '
-                              'being evaluated was trained with. When True, --input_channels '
-                              'is automatically set to 17 (11 raw bands + NDVI, NDWI, NDMI, '
-                              'BSI, FAI, FDI) regardless of what --input_channels is passed, '
-                              'so the two flags can never end up inconsistent.')
+                              'being evaluated was trained with. --input_channels is '
+                              'automatically adjusted (+6: NDVI, NDWI, NDMI, BSI, FAI, FDI) '
+                              'regardless of what --input_channels is passed, so the flags '
+                              'can never end up inconsistent.')
+    parser.add_argument('--use_texture_features', default=False, type=bool,
+                         help='Must match the --use_texture_features setting the checkpoint '
+                              'being evaluated was trained with. --input_channels is '
+                              'automatically adjusted (+2: local std-dev, gradient magnitude) '
+                              'regardless of what --input_channels is passed. Can be combined '
+                              'with --use_spectral_indices.')
 
     parser.add_argument('--model_path', default=None, type=str,
                          help='Path to the trained checkpoint (.pth). If omitted, the '
@@ -560,9 +567,10 @@ if __name__ == "__main__":
         options['tta_rotations'] = [options['tta_rotations']]
 
     # Authoritative, not just a default: this can never drift out of sync
-    # with --use_spectral_indices, regardless of what --input_channels was
-    # passed on the command line.
-    if options['use_spectral_indices']:
-        options['input_channels'] = 11 + len(SPECTRAL_INDEX_NAMES)
+    # with --use_spectral_indices / --use_texture_features, regardless of
+    # what --input_channels was passed on the command line.
+    options['input_channels'] = 11 \
+        + (len(SPECTRAL_INDEX_NAMES) if options['use_spectral_indices'] else 0) \
+        + (len(TEXTURE_FEATURE_NAMES) if options['use_texture_features'] else 0)
 
     main(options)

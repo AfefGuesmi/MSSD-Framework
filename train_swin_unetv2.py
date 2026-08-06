@@ -319,11 +319,13 @@ def main(options):
             spectral_jitter_prob=options['spectral_jitter_prob'],
             spectral_jitter_strength=options['spectral_jitter_strength'],
             use_spectral_indices=options['use_spectral_indices'],
+            use_texture_features=options['use_texture_features'],
         )
         val_dataset = GenDEBRIS(
             'val', transform=transform_test, standardization=standardization,
             agg_to_water=options['agg_to_water'],
             use_spectral_indices=options['use_spectral_indices'],
+            use_texture_features=options['use_texture_features'],
             # No rare_classes / copy_paste_prob / spectral_jitter_prob here:
             # those are train-only augmentations. use_spectral_indices is a
             # feature representation, not an augmentation, so it MUST match
@@ -401,6 +403,7 @@ def main(options):
             'test', transform=transform_test, standardization=standardization,
             agg_to_water=options['agg_to_water'],
             use_spectral_indices=options['use_spectral_indices'],
+            use_texture_features=options['use_texture_features'],
         )
         num_input_channels = test_dataset.num_channels
         test_loader = DataLoader(
@@ -740,8 +743,8 @@ if __name__ == "__main__":
     parser.add_argument('--input_channels', default=11, type=int,
                          help='Number of input bands. Ignored/overridden in practice: the '
                               'model is actually built with in_chans = train_dataset.num_channels '
-                              '(11, or 17 with --use_spectral_indices), so this can never drift '
-                              'out of sync with --use_spectral_indices.')
+                              '(11, +6 with --use_spectral_indices, +2 with --use_texture_features), '
+                              'so this can never drift out of sync with either flag.')
     parser.add_argument('--use_spectral_indices', default=False, type=bool,
                          help='Append 6 spectral indices (NDVI, NDWI, NDMI, BSI, FAI, FDI) as '
                               'extra input channels after the 11 raw bands -- the same class of '
@@ -749,6 +752,14 @@ if __name__ == "__main__":
                               'baseline an edge over from-scratch deep models trained on raw '
                               'bands alone. Applies to train/val/test identically (it is a '
                               'feature representation, not a train-only augmentation).')
+    parser.add_argument('--use_texture_features', default=False, type=bool,
+                         help='Append 2 fast texture features (local std-dev + gradient magnitude '
+                              'over a 13x13 window) as extra input channels -- a cheap proxy for '
+                              'the GLCM texture features (Contrast, Energy, etc.) that MARIDA\'s '
+                              'own feature-importance analysis found to be individually the most '
+                              'informative feature for their winning RF variant. Applies to '
+                              'train/val/test identically. Can be combined with '
+                              '--use_spectral_indices.')
     parser.add_argument('--output_channels', default=11, type=int, help='Number of output classes')
     parser.add_argument('--weight_param', default=1.03, type=float,
                         help='Weighting parameter for Loss Function')

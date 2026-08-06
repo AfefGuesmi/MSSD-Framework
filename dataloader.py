@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torchvision.transforms.functional as F
 from osgeo import gdal
+from scipy import ndimage
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
@@ -116,6 +117,66 @@ def compute_spectral_indices(img):
     return indices
 
 
+TEXTURE_FEATURE_NAMES = ['local_std', 'gradient_magnitude']
+_TEXTURE_WINDOW = 13  # matches the 13x13 GLCM window used in the MARIDA paper
+
+
+def compute_texture_features(img, window=_TEXTURE_WINDOW):
+    """
+    Compute 2 fast texture features from an (H, W, 11) or (11, H, W) raw
+    band array: local standard deviation and local gradient magnitude,
+    over a `window`x`window` neighbourhood (13x13, matching the GLCM
+    window MARIDA used) on a luminance composite of the visible bands.
+
+    This is a *proxy* for the GLCM texture features (Contrast,
+    Dissimilarity, Homogeneity, Energy, Correlation, ASM) used in the
+    original MARIDA Random Forest -- not a re-implementation. True GLCM
+    requires quantizing the image and counting pixel co-occurrence pairs
+    within a sliding window, which is too slow to run on-the-fly once per
+    sample per epoch. Local std and gradient magnitude are cheap
+    (vectorised, O(HW)) approximations that capture the same underlying
+    idea -- "how rough/high-contrast is the neighbourhood around this
+    pixel" -- which MARIDA's own feature-importance analysis (Fig. 6 of
+    Kikaki et al., 2022) found to be the single most informative feature
+    (CON) for their winning RF variant.
+
+    Args:
+        img (np.ndarray): (H, W, 11) or (11, H, W) raw-band array.
+        window (int): side length of the local window (odd number).
+
+    Returns:
+        np.ndarray: texture features in the same layout as the input
+        ((H, W, 2) or (2, H, W)), order matching TEXTURE_FEATURE_NAMES.
+    """
+    channels_last = img.shape[-1] == 11
+    if not channels_last:
+        img = np.moveaxis(img, 0, -1)  # -> (H, W, 11)
+
+    # Luminance composite from the visible bands (B4=Red, B3=Green, B2=Blue),
+    # matching MARIDA's "Rayleigh corrected RGB composites converted to
+    # grayscale" description for their GLCM computation.
+    gray = (0.299 * img[..., _B4] + 0.587 * img[..., _B3] + 0.114 * img[..., _B2]).astype(np.float32)
+
+    # Local standard deviation via the identity Var(X) = E[X^2] - E[X]^2,
+    # computed with fast windowed means (uniform_filter is a separable
+    # box-filter convolution, O(HW) regardless of window size).
+    local_mean = ndimage.uniform_filter(gray, size=window, mode='reflect')
+    local_sq_mean = ndimage.uniform_filter(gray * gray, size=window, mode='reflect')
+    local_var = np.clip(local_sq_mean - local_mean ** 2, 0.0, None)  # guard tiny negative FP error
+    local_std = np.sqrt(local_var).astype(np.float32)
+
+    # Sobel gradient magnitude -- a standard, cheap edge/contrast measure.
+    gx = ndimage.sobel(gray, axis=1, mode='reflect')
+    gy = ndimage.sobel(gray, axis=0, mode='reflect')
+    gradient_magnitude = np.sqrt(gx ** 2 + gy ** 2).astype(np.float32)
+
+    features = np.stack([local_std, gradient_magnitude], axis=-1)
+
+    if not channels_last:
+        features = np.moveaxis(features, -1, 0)  # -> (2, H, W)
+    return features
+
+
 class GenDEBRIS(Dataset):
     """
     PyTorch Dataset for MARIDA Sentinel-2 patches.
@@ -148,14 +209,24 @@ class GenDEBRIS(Dataset):
             model direct access to the same class of hand-engineered
             features that gave MARIDA's own Random Forest baseline an
             edge over from-scratch deep models trained on raw bands
-            alone. Changes self.num_channels from 11 to 17. Must be set
-            consistently across train/val/test splits used together.
+            alone. Adds 6 to self.num_channels. Must be set consistently
+            across train/val/test splits used together.
+        use_texture_features (bool): If True, append 2 fast texture
+            features (local standard deviation + gradient magnitude over
+            a 13x13 window -- see compute_texture_features) as extra
+            input channels. A cheap proxy for the GLCM texture features
+            (Contrast, Energy, etc.) that MARIDA's own feature-importance
+            analysis found to be individually more informative than any
+            single spectral index for their winning RF variant. Adds 2
+            to self.num_channels. Must be set consistently across
+            train/val/test splits used together.
     """
 
     def __init__(self, mode='train', transform=None, standardization=None,
                  path=DATASET_PATH, agg_to_water=True, rare_classes=None,
                  copy_paste_prob=0.0, spectral_jitter_prob=0.0,
-                 spectral_jitter_strength=0.05, use_spectral_indices=False):
+                 spectral_jitter_strength=0.05, use_spectral_indices=False,
+                 use_texture_features=False):
         super().__init__()
 
         split_file = os.path.join(path, 'splits', f'{mode}_X.txt')
@@ -210,12 +281,17 @@ class GenDEBRIS(Dataset):
         self.spectral_jitter_strength = spectral_jitter_strength
 
         self.use_spectral_indices = use_spectral_indices
+        self.use_texture_features = use_texture_features
         self.n_raw_bands = len(BANDS_MEAN)  # 11
-        self.num_channels = self.n_raw_bands + (len(SPECTRAL_INDEX_NAMES) if use_spectral_indices else 0)
-        if use_spectral_indices:
+        n_extra = (len(SPECTRAL_INDEX_NAMES) if use_spectral_indices else 0) \
+            + (len(TEXTURE_FEATURE_NAMES) if use_texture_features else 0)
+        self.num_channels = self.n_raw_bands + n_extra
+        if use_spectral_indices or use_texture_features:
+            extra_names = (SPECTRAL_INDEX_NAMES if use_spectral_indices else []) \
+                + (TEXTURE_FEATURE_NAMES if use_texture_features else [])
             logging.info(
-                "GenDEBRIS(%s): spectral indices enabled (%s), num_channels=%d (%d raw + %d indices).",
-                mode, SPECTRAL_INDEX_NAMES, self.num_channels, self.n_raw_bands, len(SPECTRAL_INDEX_NAMES)
+                "GenDEBRIS(%s): extra input channels enabled (%s), num_channels=%d (%d raw + %d extra).",
+                mode, extra_names, self.num_channels, self.n_raw_bands, n_extra
             )
 
         self._rare_class_patch_indices = []
@@ -244,6 +320,23 @@ class GenDEBRIS(Dataset):
         """Indices of patches containing at least one rare class, for use as copy-paste donors."""
         return [i for i, m in enumerate(self.masks) if np.isin(m, self.rare_classes).any()]
 
+    def _compute_extra_channels(self, raw_img):
+        """
+        Build the extra-channel block (spectral indices and/or texture
+        features, per whichever flags are enabled) for an (H, W, 11) raw,
+        NaN-imputed band array. Returns an (H, W, 0-8) array (0 wide if
+        neither is enabled) so callers can always do
+        `np.concatenate([raw_img, extra], axis=-1)` uniformly.
+        """
+        parts = []
+        if self.use_spectral_indices:
+            parts.append(compute_spectral_indices(raw_img))
+        if self.use_texture_features:
+            parts.append(compute_texture_features(raw_img))
+        if not parts:
+            return np.zeros(raw_img.shape[:2] + (0,), dtype=np.float32)
+        return np.concatenate(parts, axis=-1)
+
     def _copy_paste_rare_classes(self, img, mask):
         """
         Paste rare-class pixels from a randomly chosen donor patch (one
@@ -255,9 +348,9 @@ class GenDEBRIS(Dataset):
 
         Args:
             img (np.ndarray): (H, W, C) image, already NaN-imputed. C is
-                11 raw bands, or 11 + len(SPECTRAL_INDEX_NAMES) if
-                use_spectral_indices is enabled (indices already appended
-                by the caller) -- the donor is built to match.
+                11 raw bands, plus any extra channels already appended by
+                the caller (spectral indices and/or texture features) --
+                the donor is built to match via _compute_extra_channels.
             mask (np.ndarray): (H, W) integer class labels.
 
         Returns:
@@ -271,11 +364,11 @@ class GenDEBRIS(Dataset):
         donor_nan_mask = np.isnan(donor_img)
         donor_img[donor_nan_mask] = self.impute_nan[donor_nan_mask]
 
-        if self.use_spectral_indices:
-            # Match the recipient's channel layout (11 raw bands + indices)
-            # so the paste-mask assignment below has matching channel counts.
-            donor_indices = compute_spectral_indices(donor_img)
-            donor_img = np.concatenate([donor_img, donor_indices], axis=-1)
+        if self.use_spectral_indices or self.use_texture_features:
+            # Match the recipient's channel layout so the paste-mask
+            # assignment below has matching channel counts.
+            donor_extra = self._compute_extra_channels(donor_img)
+            donor_img = np.concatenate([donor_img, donor_extra], axis=-1)
 
         paste_mask = np.isin(donor_mask, self.rare_classes)
         if not paste_mask.any():
@@ -346,16 +439,16 @@ class GenDEBRIS(Dataset):
         nan_mask = np.isnan(img)
         img[nan_mask] = self.impute_nan[nan_mask]
 
-        # ---- Spectral indices ----
+        # ---- Extra channels: spectral indices and/or texture features ----
         # Computed from raw reflectance (before copy-paste/transform) and
         # concatenated as extra channels, so they flow through copy-paste
         # and the geometric transform (rotation/flip) exactly like the raw
         # bands and stay spatially aligned. Split back out below, after the
         # transform, so standardization is only ever applied to the raw
         # bands it was fit for.
-        if self.use_spectral_indices:
-            indices = compute_spectral_indices(img)
-            img = np.concatenate([img, indices], axis=-1)
+        if self.use_spectral_indices or self.use_texture_features:
+            extra = self._compute_extra_channels(img)
+            img = np.concatenate([img, extra], axis=-1)
 
         # ---- Copy-paste rare-class augmentation ----
         # Runs before the geometric transform below, so the pasted region
@@ -380,20 +473,20 @@ class GenDEBRIS(Dataset):
 
         # ---- Split raw bands / spectral indices, jitter + standardize raw only ----
         # Spectral indices are already-bounded ratios (roughly [-1, 1], or
-        # small band differences for FAI/FDI) computed from *raw*
-        # reflectance -- they must not be passed through standardization
-        # fit on raw-band statistics, and jitter (a raw-sensor-noise
-        # simulation) is only meaningful on the raw bands.
-        if self.use_spectral_indices:
+        # small band differences for FAI/FDI, or texture magnitudes) computed
+        # from *raw* reflectance -- they must not be passed through
+        # standardization fit on raw-band statistics, and jitter (a raw-
+        # sensor-noise simulation) is only meaningful on the raw bands.
+        if self.use_spectral_indices or self.use_texture_features:
             raw = img[:self.n_raw_bands]
-            idx = img[self.n_raw_bands:]
+            extra = img[self.n_raw_bands:]
 
             if self.spectral_jitter_prob > 0 and random.random() < self.spectral_jitter_prob:
                 raw = self._spectral_jitter(raw)
             if self.standardization is not None:
                 raw = self.standardization(raw)
 
-            img = torch.cat([raw, idx], dim=0)
+            img = torch.cat([raw, extra], dim=0)
         else:
             # ---- Spectral jitter ----
             # Image channels only -- applied after the mask has already been
