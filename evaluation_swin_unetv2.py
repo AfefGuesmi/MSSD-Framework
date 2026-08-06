@@ -52,7 +52,7 @@ sys.path.append(os.path.join(PROJECT_ROOT, 'utils'))
 from utils.config import Config
 from mssd_net import build_mssd_net, VARIANTS
 from unet import UNet
-from dataloader import GenDEBRIS, BANDS_MEAN, BANDS_STD, DATASET_PATH
+from dataloader import GenDEBRIS, BANDS_MEAN, BANDS_STD, DATASET_PATH, SPECTRAL_INDEX_NAMES
 from utils.metrics import Evaluation
 
 try:
@@ -327,7 +327,8 @@ def main(options):
     # Data
     dataset_test = GenDEBRIS('test', transform=transform_test,
                               standardization=standardization,
-                              agg_to_water=options['agg_to_water'])
+                              agg_to_water=options['agg_to_water'],
+                              use_spectral_indices=options['use_spectral_indices'])
     test_loader = DataLoader(dataset_test, batch_size=options['batch'], shuffle=False)
 
     class_names = list(ALL_LABELS)
@@ -513,6 +514,12 @@ if __name__ == "__main__":
 
     parser.add_argument('--input_channels', default=11, type=int, help='Number of input bands')
     parser.add_argument('--output_channels', default=11, type=int, help='Number of output classes')
+    parser.add_argument('--use_spectral_indices', default=False, type=bool,
+                         help='Must match the --use_spectral_indices setting the checkpoint '
+                              'being evaluated was trained with. When True, --input_channels '
+                              'is automatically set to 17 (11 raw bands + NDVI, NDWI, NDMI, '
+                              'BSI, FAI, FDI) regardless of what --input_channels is passed, '
+                              'so the two flags can never end up inconsistent.')
 
     parser.add_argument('--model_path', default=None, type=str,
                          help='Path to the trained checkpoint (.pth). If omitted, the '
@@ -551,5 +558,11 @@ if __name__ == "__main__":
     options['tta_rotations'] = ast.literal_eval(options['tta_rotations'])
     if not isinstance(options['tta_rotations'], (list, tuple)):
         options['tta_rotations'] = [options['tta_rotations']]
+
+    # Authoritative, not just a default: this can never drift out of sync
+    # with --use_spectral_indices, regardless of what --input_channels was
+    # passed on the command line.
+    if options['use_spectral_indices']:
+        options['input_channels'] = 11 + len(SPECTRAL_INDEX_NAMES)
 
     main(options)

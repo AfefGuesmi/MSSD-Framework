@@ -318,12 +318,17 @@ def main(options):
             copy_paste_prob=options['copy_paste_prob'],
             spectral_jitter_prob=options['spectral_jitter_prob'],
             spectral_jitter_strength=options['spectral_jitter_strength'],
+            use_spectral_indices=options['use_spectral_indices'],
         )
         val_dataset = GenDEBRIS(
             'val', transform=transform_test, standardization=standardization,
-            agg_to_water=options['agg_to_water']
+            agg_to_water=options['agg_to_water'],
+            use_spectral_indices=options['use_spectral_indices'],
             # No rare_classes / copy_paste_prob / spectral_jitter_prob here:
-            # validation must stay deterministic and unaugmented.
+            # those are train-only augmentations. use_spectral_indices is a
+            # feature representation, not an augmentation, so it MUST match
+            # train -- val/test need the same input channels as the model
+            # was built and trained for.
         )
 
         logging.info(
@@ -331,6 +336,7 @@ def main(options):
             len(train_dataset), len(val_dataset)
         )
         print(f"Patches after augmentation - train: {len(train_dataset)}, val: {len(val_dataset)}")
+        num_input_channels = train_dataset.num_channels
 
         # ---- Rare-class oversampling ----
         # Plain shuffle=True samples every patch with equal probability.
@@ -393,8 +399,10 @@ def main(options):
     elif options['mode'] == 'test':
         test_dataset = GenDEBRIS(
             'test', transform=transform_test, standardization=standardization,
-            agg_to_water=options['agg_to_water']
+            agg_to_water=options['agg_to_water'],
+            use_spectral_indices=options['use_spectral_indices'],
         )
+        num_input_channels = test_dataset.num_channels
         test_loader = DataLoader(
             test_dataset,
             batch_size=options['batch'],
@@ -426,7 +434,7 @@ def main(options):
         options['variant'],
         img_size=config.DATA.IMG_SIZE,
         patch_size=getattr(swin_cfg, 'PATCH_SIZE', 4),
-        in_chans=options['input_channels'],
+        in_chans=num_input_channels,  # from GenDEBRIS.num_channels: 11, or 17 with --use_spectral_indices
         num_classes=options['output_channels'],
         embed_dim=getattr(swin_cfg, 'EMBED_DIM', 96),
         depths=getattr(swin_cfg, 'DEPTHS', [2, 2, 2, 2]),
@@ -729,7 +737,18 @@ if __name__ == "__main__":
                              "on the metrics actually reported, which better tracks rare-class "
                              "quality under MARIDA's class imbalance than 'val_loss'.")
 
-    parser.add_argument('--input_channels', default=11, type=int, help='Number of input bands')
+    parser.add_argument('--input_channels', default=11, type=int,
+                         help='Number of input bands. Ignored/overridden in practice: the '
+                              'model is actually built with in_chans = train_dataset.num_channels '
+                              '(11, or 17 with --use_spectral_indices), so this can never drift '
+                              'out of sync with --use_spectral_indices.')
+    parser.add_argument('--use_spectral_indices', default=False, type=bool,
+                         help='Append 6 spectral indices (NDVI, NDWI, NDMI, BSI, FAI, FDI) as '
+                              'extra input channels after the 11 raw bands -- the same class of '
+                              'hand-engineered features that gave MARIDA\'s own Random Forest '
+                              'baseline an edge over from-scratch deep models trained on raw '
+                              'bands alone. Applies to train/val/test identically (it is a '
+                              'feature representation, not a train-only augmentation).')
     parser.add_argument('--output_channels', default=11, type=int, help='Number of output classes')
     parser.add_argument('--weight_param', default=1.03, type=float,
                         help='Weighting parameter for Loss Function')

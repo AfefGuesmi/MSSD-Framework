@@ -47,6 +47,74 @@ BANDS_STD = np.array([
 # Path to data directory (relative to this file)
 DATASET_PATH = os.path.join(up(__file__), 'data')
 
+# Band order for the 11 raw Sentinel-2 bands used throughout this file and
+# by GenDEBRIS (matches MARIDA's ACOLITE-processed bands, Vapour/B9 and
+# Cirrus/B10 excluded): B1, B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12.
+# Index into the last axis of a (H, W, 11) or first axis of a (11, H, W)
+# raw-band array/tensor:
+_B1, _B2, _B3, _B4, _B5, _B6, _B7, _B8, _B8A, _B11, _B12 = range(11)
+
+# Approximate Sentinel-2 central wavelengths (nm) for the bands used below.
+_WL = {'B4': 665.0, 'B6': 740.0, 'B8': 842.0, 'B11': 1610.0}
+
+_SPECTRAL_INDEX_EPS = 1e-6
+SPECTRAL_INDEX_NAMES = ['NDVI', 'NDWI', 'NDMI', 'BSI', 'FAI', 'FDI']
+
+
+def compute_spectral_indices(img):
+    """
+    Compute 6 spectral indices from an (H, W, 11) raw-reflectance array (or
+    (11, H, W); auto-detected), in the same band order as BANDS_MEAN/STD.
+    These are the same class of hand-engineered features (spectral indices
+    + implicitly, texture via CON in the original MARIDA study) that gave
+    MARIDA's Random Forest baseline its edge over from-scratch deep models
+    trained on raw bands alone -- stacking them as extra input channels
+    lets the network use the same information directly instead of having
+    to re-derive it from ~700 training patches.
+
+    Indices (all bounded, roughly in [-1, 1] except FAI/FDI which are
+    small band-difference values, typically within [-0.1, 0.1]):
+        NDVI = (B8 - B4) / (B8 + B4)                          [vegetation]
+        NDWI = (B3 - B8) / (B3 + B8)          [McFeeters 1996; water]
+        NDMI = (B8 - B11) / (B8 + B11)                        [moisture]
+        BSI  = ((B11+B4) - (B8+B2)) / ((B11+B4) + (B8+B2))    [bare soil]
+        FAI  = B8 - [B4 + (B11-B4) * (842-665)/(1610-665)]
+                                          [Hu 2009; floating algae]
+        FDI  = B8 - [B6 + (B11-B6) * (842-740)/(1610-740) * 10]
+                                          [Biermann et al. 2020; floating debris]
+
+    Args:
+        img (np.ndarray): (H, W, 11) or (11, H, W) raw-band array.
+
+    Returns:
+        np.ndarray: indices in the same layout as the input
+        ((H, W, 6) or (6, H, W)), order matching SPECTRAL_INDEX_NAMES.
+    """
+    channels_last = img.shape[-1] == 11
+    if not channels_last:
+        img = np.moveaxis(img, 0, -1)  # -> (H, W, 11)
+
+    eps = _SPECTRAL_INDEX_EPS
+    b2, b3, b4 = img[..., _B2], img[..., _B3], img[..., _B4]
+    b6, b8, b11 = img[..., _B6], img[..., _B8], img[..., _B11]
+
+    ndvi = (b8 - b4) / (b8 + b4 + eps)
+    ndwi = (b3 - b8) / (b3 + b8 + eps)
+    ndmi = (b8 - b11) / (b8 + b11 + eps)
+    bsi = ((b11 + b4) - (b8 + b2)) / ((b11 + b4) + (b8 + b2) + eps)
+
+    fai_baseline = b4 + (b11 - b4) * (_WL['B8'] - _WL['B4']) / (_WL['B11'] - _WL['B4'])
+    fai = b8 - fai_baseline
+
+    fdi_baseline = b6 + (b11 - b6) * (_WL['B8'] - _WL['B6']) / (_WL['B11'] - _WL['B6']) * 10.0
+    fdi = b8 - fdi_baseline
+
+    indices = np.stack([ndvi, ndwi, ndmi, bsi, fai, fdi], axis=-1).astype(np.float32)
+
+    if not channels_last:
+        indices = np.moveaxis(indices, -1, 0)  # -> (6, H, W)
+    return indices
+
 
 class GenDEBRIS(Dataset):
     """
@@ -74,12 +142,20 @@ class GenDEBRIS(Dataset):
         spectral_jitter_strength (float): Each band's multiplicative jitter
             factor is drawn uniformly from
             [1 - spectral_jitter_strength, 1 + spectral_jitter_strength].
+        use_spectral_indices (bool): If True, append 6 spectral indices
+            (NDVI, NDWI, NDMI, BSI, FAI, FDI -- see compute_spectral_indices)
+            as extra input channels after the 11 raw bands, giving the
+            model direct access to the same class of hand-engineered
+            features that gave MARIDA's own Random Forest baseline an
+            edge over from-scratch deep models trained on raw bands
+            alone. Changes self.num_channels from 11 to 17. Must be set
+            consistently across train/val/test splits used together.
     """
 
     def __init__(self, mode='train', transform=None, standardization=None,
                  path=DATASET_PATH, agg_to_water=True, rare_classes=None,
                  copy_paste_prob=0.0, spectral_jitter_prob=0.0,
-                 spectral_jitter_strength=0.05):
+                 spectral_jitter_strength=0.05, use_spectral_indices=False):
         super().__init__()
 
         split_file = os.path.join(path, 'splits', f'{mode}_X.txt')
@@ -133,6 +209,15 @@ class GenDEBRIS(Dataset):
         self.spectral_jitter_prob = spectral_jitter_prob
         self.spectral_jitter_strength = spectral_jitter_strength
 
+        self.use_spectral_indices = use_spectral_indices
+        self.n_raw_bands = len(BANDS_MEAN)  # 11
+        self.num_channels = self.n_raw_bands + (len(SPECTRAL_INDEX_NAMES) if use_spectral_indices else 0)
+        if use_spectral_indices:
+            logging.info(
+                "GenDEBRIS(%s): spectral indices enabled (%s), num_channels=%d (%d raw + %d indices).",
+                mode, SPECTRAL_INDEX_NAMES, self.num_channels, self.n_raw_bands, len(SPECTRAL_INDEX_NAMES)
+            )
+
         self._rare_class_patch_indices = []
         if self.copy_paste_prob > 0:
             if not self.rare_classes:
@@ -169,7 +254,10 @@ class GenDEBRIS(Dataset):
         training, on top of (not instead of) sample-level oversampling.
 
         Args:
-            img (np.ndarray): (H, W, C) image, already NaN-imputed.
+            img (np.ndarray): (H, W, C) image, already NaN-imputed. C is
+                11 raw bands, or 11 + len(SPECTRAL_INDEX_NAMES) if
+                use_spectral_indices is enabled (indices already appended
+                by the caller) -- the donor is built to match.
             mask (np.ndarray): (H, W) integer class labels.
 
         Returns:
@@ -182,6 +270,12 @@ class GenDEBRIS(Dataset):
         # Impute the donor's NaNs the same way __getitem__ does for the main image.
         donor_nan_mask = np.isnan(donor_img)
         donor_img[donor_nan_mask] = self.impute_nan[donor_nan_mask]
+
+        if self.use_spectral_indices:
+            # Match the recipient's channel layout (11 raw bands + indices)
+            # so the paste-mask assignment below has matching channel counts.
+            donor_indices = compute_spectral_indices(donor_img)
+            donor_img = np.concatenate([donor_img, donor_indices], axis=-1)
 
         paste_mask = np.isin(donor_mask, self.rare_classes)
         if not paste_mask.any():
@@ -252,6 +346,17 @@ class GenDEBRIS(Dataset):
         nan_mask = np.isnan(img)
         img[nan_mask] = self.impute_nan[nan_mask]
 
+        # ---- Spectral indices ----
+        # Computed from raw reflectance (before copy-paste/transform) and
+        # concatenated as extra channels, so they flow through copy-paste
+        # and the geometric transform (rotation/flip) exactly like the raw
+        # bands and stay spatially aligned. Split back out below, after the
+        # transform, so standardization is only ever applied to the raw
+        # bands it was fit for.
+        if self.use_spectral_indices:
+            indices = compute_spectral_indices(img)
+            img = np.concatenate([img, indices], axis=-1)
+
         # ---- Copy-paste rare-class augmentation ----
         # Runs before the geometric transform below, so the pasted region
         # also gets rotated/flipped consistently along with the rest of
@@ -273,14 +378,31 @@ class GenDEBRIS(Dataset):
             img = torch.from_numpy(np.moveaxis(img, -1, 0))  # back to (C, H, W)
             mask = torch.from_numpy(mask)
 
-        # ---- Spectral jitter ----
-        # Image channels only -- applied after the mask has already been
-        # split back out, so the (integer) class labels are never touched.
-        if self.spectral_jitter_prob > 0 and random.random() < self.spectral_jitter_prob:
-            img = self._spectral_jitter(img)
+        # ---- Split raw bands / spectral indices, jitter + standardize raw only ----
+        # Spectral indices are already-bounded ratios (roughly [-1, 1], or
+        # small band differences for FAI/FDI) computed from *raw*
+        # reflectance -- they must not be passed through standardization
+        # fit on raw-band statistics, and jitter (a raw-sensor-noise
+        # simulation) is only meaningful on the raw bands.
+        if self.use_spectral_indices:
+            raw = img[:self.n_raw_bands]
+            idx = img[self.n_raw_bands:]
 
-        if self.standardization is not None:
-            img = self.standardization(img)
+            if self.spectral_jitter_prob > 0 and random.random() < self.spectral_jitter_prob:
+                raw = self._spectral_jitter(raw)
+            if self.standardization is not None:
+                raw = self.standardization(raw)
+
+            img = torch.cat([raw, idx], dim=0)
+        else:
+            # ---- Spectral jitter ----
+            # Image channels only -- applied after the mask has already been
+            # split back out, so the (integer) class labels are never touched.
+            if self.spectral_jitter_prob > 0 and random.random() < self.spectral_jitter_prob:
+                img = self._spectral_jitter(img)
+
+            if self.standardization is not None:
+                img = self.standardization(img)
 
         return img, mask
 
