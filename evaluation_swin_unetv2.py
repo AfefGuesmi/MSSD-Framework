@@ -52,7 +52,11 @@ sys.path.append(os.path.join(PROJECT_ROOT, 'utils'))
 from utils.config import Config
 from mssd_net import build_mssd_net, VARIANTS
 from unet import UNet
-from dataloader import GenDEBRIS, BANDS_MEAN, BANDS_STD, DATASET_PATH, SPECTRAL_INDEX_NAMES, TEXTURE_FEATURE_NAMES
+from dataloader import (
+    GenDEBRIS, BANDS_MEAN, BANDS_STD, DATASET_PATH,
+    SPECTRAL_INDEX_NAMES, TEXTURE_FEATURE_NAMES,
+    compute_spectral_indices, compute_texture_features,
+)
 from utils.metrics import Evaluation
 
 try:
@@ -467,8 +471,37 @@ def main(options):
                 nan_mask = np.isnan(image)
                 image[nan_mask] = impute_nan[nan_mask]
 
+                # ---- Extra channels: spectral indices and/or texture features ----
+                # This loop loads raw images directly via rasterio (to
+                # preserve georeferencing for the output mask) instead of
+                # going through GenDEBRIS, so it must replicate the same
+                # extra-channel computation GenDEBRIS.__getitem__ applies --
+                # otherwise a model trained with --use_spectral_indices /
+                # --use_texture_features gets an 11-channel input here
+                # instead of the 13/17/19 channels it expects.
+                extra_parts = []
+                if options['use_spectral_indices']:
+                    extra_parts.append(compute_spectral_indices(image))
+                if options['use_texture_features']:
+                    extra_parts.append(compute_texture_features(image))
+                has_extra_channels = bool(extra_parts)
+                if has_extra_channels:
+                    extra = np.concatenate(extra_parts, axis=-1)
+                    image = np.concatenate([image, extra], axis=-1)
+
                 image = transform_test(image)
-                image = standardization(image)
+
+                if has_extra_channels:
+                    # Standardization was fit on the 11 raw bands only --
+                    # split it out, standardize just that part, and keep
+                    # the extra channels (already-bounded ratios/texture
+                    # magnitudes) untouched, exactly like GenDEBRIS does.
+                    n_raw = len(BANDS_MEAN)
+                    raw = standardization(image[:n_raw])
+                    image = torch.cat([raw, image[n_raw:]], dim=0)
+                else:
+                    image = standardization(image)
+
                 image = image.to(device)
 
                 if options['tta']:
