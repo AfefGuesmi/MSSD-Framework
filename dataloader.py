@@ -234,10 +234,16 @@ class GenDEBRIS(Dataset):
                  path=DATASET_PATH, agg_to_water=True, rare_classes=None,
                  copy_paste_prob=0.0, spectral_jitter_prob=0.0,
                  spectral_jitter_strength=0.05, use_spectral_indices=False,
-                 use_texture_features=False, use_confidence_weighting=False):
+                 use_texture_features=False, use_confidence_weighting=False,
+                 splits_dir='splits'):
         super().__init__()
 
-        split_file = os.path.join(path, 'splits', f'{mode}_X.txt')
+        # splits_dir: 'splits' (default) uses MARIDA's official ~50/24/26
+        # split. Pass e.g. 'splits_80_10_10' (see create_custom_split.py)
+        # to use a custom ratio instead -- NOTE this breaks direct
+        # comparability with MARIDA's own reported numbers, which use
+        # their official split.
+        split_file = os.path.join(path, splits_dir, f'{mode}_X.txt')
         self.rois = np.genfromtxt(split_file, dtype='str')
 
         self.images = []       # list of image arrays (C, H, W)

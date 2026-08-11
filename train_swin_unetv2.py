@@ -350,6 +350,7 @@ def main(options):
             use_spectral_indices=options['use_spectral_indices'],
             use_texture_features=options['use_texture_features'],
             use_confidence_weighting=options['use_confidence_weighting'],
+            splits_dir=options['splits_dir'],
         )
         val_dataset = GenDEBRIS(
             'val', transform=transform_test, standardization=standardization,
@@ -357,6 +358,7 @@ def main(options):
             use_spectral_indices=options['use_spectral_indices'],
             use_texture_features=options['use_texture_features'],
             use_confidence_weighting=options['use_confidence_weighting'],
+            splits_dir=options['splits_dir'],
             # No rare_classes / copy_paste_prob / spectral_jitter_prob here:
             # those are train-only augmentations. use_spectral_indices,
             # use_texture_features, and use_confidence_weighting are all
@@ -438,6 +440,7 @@ def main(options):
             use_spectral_indices=options['use_spectral_indices'],
             use_texture_features=options['use_texture_features'],
             use_confidence_weighting=options['use_confidence_weighting'],
+            splits_dir=options['splits_dir'],
         )
         num_input_channels = test_dataset.num_channels
         test_loader = DataLoader(
@@ -765,6 +768,16 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     parser.add_argument('--agg_to_water', default=True, type=bool,
                         help='Aggregate Mixed Water, Wakes, Cloud Shadows, Waves with Marine Water')
+    parser.add_argument('--splits_dir', default='splits', type=str,
+                        help="Subfolder under the MARIDA root containing {train,val,test}_X.txt. "
+                             "Default 'splits' = MARIDA's official ~50/24/26 split, directly "
+                             "comparable to MARIDA's own reported RF/U-Net numbers. Pass e.g. "
+                             "'splits_80_10_10' (see create_custom_split.py, which generates "
+                             "a scene-aware 80/10/10 split with no data leakage) to use a "
+                             "different ratio -- NOTE this breaks direct numeric comparability "
+                             "with MARIDA's reported results, since they used their official "
+                             "split; results on a different split should be reported as such, "
+                             "not merged into the same table as official-split numbers.")
     parser.add_argument('--mode', default='train', help="select between 'train' or 'test'")
     parser.add_argument('--variant', default='full', choices=list(VARIANTS.keys()),
                         help="MSSD-Net ablation variant: 'baseline' (plain Swin-UNet V2), "

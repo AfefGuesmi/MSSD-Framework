@@ -333,7 +333,8 @@ def main(options):
                               standardization=standardization,
                               agg_to_water=options['agg_to_water'],
                               use_spectral_indices=options['use_spectral_indices'],
-                              use_texture_features=options['use_texture_features'])
+                              use_texture_features=options['use_texture_features'],
+                              splits_dir=options['splits_dir'])
     test_loader = DataLoader(dataset_test, batch_size=options['batch'], shuffle=False)
 
     class_names = list(ALL_LABELS)
@@ -544,6 +545,10 @@ if __name__ == "__main__":
 
     parser.add_argument('--agg_to_water', default=True, type=bool,
                          help='Aggregate Mixed Water, Wakes, Cloud Shadows, Waves with Marine Water')
+    parser.add_argument('--splits_dir', default='splits', type=str,
+                         help="Must match the --splits_dir the checkpoint was trained with. "
+                              "Default 'splits' = MARIDA's official split. See "
+                              "create_custom_split.py for generating alternate ratios.")
     parser.add_argument('--batch', default=5, type=int, help='Batch size for evaluation')
 
     parser.add_argument('--input_channels', default=11, type=int, help='Number of input bands')
