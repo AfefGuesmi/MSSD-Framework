@@ -61,14 +61,6 @@ _WL = {'B4': 665.0, 'B6': 740.0, 'B8': 842.0, 'B11': 1610.0}
 _SPECTRAL_INDEX_EPS = 1e-6
 SPECTRAL_INDEX_NAMES = ['NDVI', 'NDWI', 'NDMI', 'BSI', 'FAI', 'FDI']
 
-# Per-pixel loss weight by annotation confidence level, matching the
-# scheme Kikaki et al. (2022) used for their RF baseline (1=high,
-# 2=moderate, 3=low confidence -> weights 1, 2/3, 1/3). Any confidence
-# code not in this map (e.g. background/unannotated regions with no
-# explicit confidence value) defaults to full weight (1.0) rather than
-# being silently down-weighted -- see _confidence_to_weight_map below.
-CONFIDENCE_WEIGHTS = {1: 1.0, 2: 2.0 / 3.0, 3: 1.0 / 3.0}
-
 
 def compute_spectral_indices(img):
     """
@@ -234,7 +226,7 @@ class GenDEBRIS(Dataset):
                  path=DATASET_PATH, agg_to_water=True, rare_classes=None,
                  copy_paste_prob=0.0, spectral_jitter_prob=0.0,
                  spectral_jitter_strength=0.05, use_spectral_indices=False,
-                 use_texture_features=False, use_confidence_weighting=False,
+                 use_texture_features=False,
                  splits_dir='splits'):
         super().__init__()
 
@@ -248,10 +240,6 @@ class GenDEBRIS(Dataset):
 
         self.images = []       # list of image arrays (C, H, W)
         self.masks = []        # list of mask arrays (H, W)
-        self.confidences = []  # list of confidence-level arrays (H, W), only if use_confidence_weighting
-
-        self.use_confidence_weighting = use_confidence_weighting
-        _confidence_file_missing_warned = False
 
         for roi in tqdm(self.rois, desc=f'Load {mode} set to memory'):
             # Build file paths
@@ -282,36 +270,6 @@ class GenDEBRIS(Dataset):
             img = ds.ReadAsArray()
             ds = None
             self.images.append(img)
-
-            # ---- Confidence-level raster (optional) ----
-            # ASSUMPTION: follows the same naming convention as the class
-            # mask ('{name}_cl.tif' -> '{name}_conf.tif'), with pixel
-            # values 1=high, 2=moderate, 3=low confidence, matching
-            # Kikaki et al. (2022)'s annotation protocol. This file path
-            # has NOT been verified against a real MARIDA download -- if
-            # your patches directory uses a different filename or value
-            # convention, this will silently fall back to uniform
-            # weighting (see the warning below) rather than crash, but you
-            # should confirm the real convention before trusting results.
-            if self.use_confidence_weighting:
-                conf_path = os.path.join(path, 'patches', folder, f'{name}_conf.tif')
-                if os.path.exists(conf_path):
-                    ds = gdal.Open(conf_path)
-                    conf = ds.ReadAsArray().astype(np.int64)
-                    ds = None
-                else:
-                    if not _confidence_file_missing_warned:
-                        logging.warning(
-                            "GenDEBRIS(%s): use_confidence_weighting=True but no confidence "
-                            "raster found at %s (and none for later patches with the same "
-                            "issue will be logged again) -- falling back to uniform weight=1.0 "
-                            "for those patches. Verify the '_conf.tif' naming convention "
-                            "against your actual MARIDA download.",
-                            mode, conf_path
-                        )
-                        _confidence_file_missing_warned = True
-                    conf = np.ones_like(mask)  # fallback: full weight everywhere
-                self.confidences.append(conf)
 
         # Pre‑compute nan imputation array
         sample_img = self.images[0]
@@ -385,7 +343,7 @@ class GenDEBRIS(Dataset):
             return np.zeros(raw_img.shape[:2] + (0,), dtype=np.float32)
         return np.concatenate(parts, axis=-1)
 
-    def _copy_paste_rare_classes(self, img, mask, weight=None):
+    def _copy_paste_rare_classes(self, img, mask):
         """
         Paste rare-class pixels from a randomly chosen donor patch (one
         known to contain at least one rare class) onto (img, mask), at the
@@ -400,16 +358,9 @@ class GenDEBRIS(Dataset):
                 the caller (spectral indices and/or texture features) --
                 the donor is built to match via _compute_extra_channels.
             mask (np.ndarray): (H, W) integer class labels.
-            weight (np.ndarray, optional): (H, W) confidence-based loss
-                weight for the recipient patch. If given, the donor's own
-                confidence weight is pasted alongside its pixels/label, so
-                a pasted rare-class region keeps the donor's real
-                annotation confidence rather than inheriting the
-                recipient's (unrelated) confidence at that location.
 
         Returns:
-            (np.ndarray, np.ndarray, np.ndarray or None): augmented
-            (img, mask, weight); weight is None iff the input was None.
+            (np.ndarray, np.ndarray): augmented (img, mask), same shapes.
         """
         donor_idx = random.choice(self._rare_class_patch_indices)
         donor_img = np.moveaxis(self.images[donor_idx], 0, -1).astype(np.float32)
@@ -427,22 +378,13 @@ class GenDEBRIS(Dataset):
 
         paste_mask = np.isin(donor_mask, self.rare_classes)
         if not paste_mask.any():
-            return img, mask, weight  # shouldn't happen given _rare_class_patch_indices, but stay safe
+            return img, mask  # shouldn't happen given _rare_class_patch_indices, but stay safe
 
         img = img.copy()
         mask = mask.copy()
         img[paste_mask] = donor_img[paste_mask]
         mask[paste_mask] = donor_mask[paste_mask]
-
-        if weight is not None:
-            weight = weight.copy()
-            if self.use_confidence_weighting and donor_idx < len(self.confidences):
-                donor_weight = self._confidence_to_weight_map(donor_idx)
-                weight[paste_mask] = donor_weight[paste_mask]
-            else:
-                weight[paste_mask] = 1.0
-
-        return img, mask, weight
+        return img, mask
 
     def _spectral_jitter(self, img):
         """
@@ -492,19 +434,6 @@ class GenDEBRIS(Dataset):
             weights.append(1.0 + boost * n_rare_present)
         return weights
 
-    def _confidence_to_weight_map(self, index):
-        """
-        Convert the raw confidence-level codes for patch `index` (1/2/3)
-        into a float per-pixel loss weight, via CONFIDENCE_WEIGHTS. Any
-        code not in that map (e.g. background pixels with no explicit
-        annotation confidence) defaults to full weight (1.0).
-        """
-        conf = self.confidences[index]
-        weight = np.ones_like(conf, dtype=np.float32)
-        for code, w in CONFIDENCE_WEIGHTS.items():
-            weight[conf == code] = w
-        return weight
-
     def __getitem__(self, index):
         img = self.images[index].copy()
         mask = self.masks[index].copy()
@@ -527,45 +456,26 @@ class GenDEBRIS(Dataset):
             extra = self._compute_extra_channels(img)
             img = np.concatenate([img, extra], axis=-1)
 
-        # ---- Confidence-based per-pixel loss weight (optional) ----
-        weight = self._confidence_to_weight_map(index) if self.use_confidence_weighting else None
-
         # ---- Copy-paste rare-class augmentation ----
         # Runs before the geometric transform below, so the pasted region
         # also gets rotated/flipped consistently along with the rest of
         # the patch.
         if self._rare_class_patch_indices and random.random() < self.copy_paste_prob:
-            img, mask, weight = self._copy_paste_rare_classes(img, mask, weight)
+            img, mask = self._copy_paste_rare_classes(img, mask)
 
         if self.transform is not None:
-            if weight is not None:
-                # Concatenate mask AND confidence weight as extra channels
-                # so both go through the same geometric transform as the
-                # image (90-degree rotations/flips are pure pixel
-                # permutations here, so exact values -- including
-                # non-integer weights like 2/3 -- are preserved).
-                mask_ch = mask[..., np.newaxis]
-                weight_ch = weight[..., np.newaxis]
-                stack = np.concatenate([img, mask_ch, weight_ch], axis=-1).astype(np.float32)
-                stack = self.transform(stack)
-                img = stack[:-2, :, :]
-                mask = stack[-2, :, :].round().long()      # round: integer class labels
-                weight = stack[-1, :, :]                    # no rounding: continuous weight
-            else:
-                # Concatenate mask as extra channel to apply same transform
-                mask_ch = mask[..., np.newaxis]
-                stack = np.concatenate([img, mask_ch], axis=-1).astype(np.float32)
-                stack = self.transform(stack)
-                # Separate image and mask
-                img = stack[:-1, :, :]
-                # Round to avoid interpolation artifacts in mask
-                mask = stack[-1, :, :].round().long()
+            # Concatenate mask as extra channel to apply same transform
+            mask_ch = mask[..., np.newaxis]
+            stack = np.concatenate([img, mask_ch], axis=-1).astype(np.float32)
+            stack = self.transform(stack)
+            # Separate image and mask
+            img = stack[:-1, :, :]
+            # Round to avoid interpolation artifacts in mask
+            mask = stack[-1, :, :].round().long()
         else:
             # Convert to tensor if no transform
             img = torch.from_numpy(np.moveaxis(img, -1, 0))  # back to (C, H, W)
             mask = torch.from_numpy(mask)
-            if weight is not None:
-                weight = torch.from_numpy(weight)
 
         # ---- Split raw bands / spectral indices, jitter + standardize raw only ----
         # Spectral indices are already-bounded ratios (roughly [-1, 1], or
@@ -593,10 +503,6 @@ class GenDEBRIS(Dataset):
             if self.standardization is not None:
                 img = self.standardization(img)
 
-        if self.use_confidence_weighting:
-            if weight is None:  # safety net; should already be set above
-                weight = torch.ones_like(mask, dtype=torch.float32)
-            return img, mask, weight
         return img, mask
 
 

@@ -118,28 +118,6 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-class ConfidenceWeightedCE(nn.Module):
-    """
-    Cross-entropy loss with an optional additional per-pixel weight (e.g.
-    annotation-confidence weight from GenDEBRIS, see --use_confidence_weighting),
-    applied on top of the existing per-class weight vector. Drop-in
-    replacement for nn.CrossEntropyLoss(weight=..., ignore_index=...) when
-    pixel_weight=None (the default): reduces to the exact same masked mean.
-    """
-
-    def __init__(self, weight=None, ignore_index=-1):
-        super().__init__()
-        self.ce = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index, reduction='none')
-        self.ignore_index = ignore_index
-
-    def forward(self, logits, targets, pixel_weight=None):
-        per_pixel = self.ce(logits, targets)  # (B, H, W); 0 at ignored positions
-        valid = (targets != self.ignore_index).float()
-        w = valid if pixel_weight is None else valid * pixel_weight
-        denom = w.sum().clamp_min(1e-8)
-        return (per_pixel * w).sum() / denom
-
-
 class FocalLoss(nn.Module):
     """Focal Loss for multi-class segmentation."""
 
@@ -150,21 +128,19 @@ class FocalLoss(nn.Module):
         self.ignore_index = ignore_index
         self.reduction = reduction
 
-    def forward(self, inputs, targets, pixel_weight=None):
+    def forward(self, inputs, targets):
         ce_loss = F.cross_entropy(
             inputs, targets, reduction='none',
             weight=self.alpha, ignore_index=self.ignore_index
         )
-        valid_mask = (targets != self.ignore_index).float()
+        valid_mask = targets != self.ignore_index
         pt = torch.exp(-ce_loss)
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        w = valid_mask if pixel_weight is None else valid_mask * pixel_weight
-        focal_loss = focal_loss * w
+        focal_loss = focal_loss * valid_mask
 
         if self.reduction == 'mean':
-            denom = w.sum()
-            if denom > 0:
-                return focal_loss.sum() / denom
+            if valid_mask.sum() > 0:
+                return focal_loss.sum() / valid_mask.sum()
             return torch.tensor(0.0, device=inputs.device)
         if self.reduction == 'sum':
             return focal_loss.sum()
@@ -174,9 +150,7 @@ class FocalLoss(nn.Module):
 class DiceLoss(nn.Module):
     """
     Soft Dice loss for multi-class segmentation, optionally class-weighted
-    with the same weight vector used for CrossEntropyLoss (--weight_param),
-    and optionally further weighted per-pixel by annotation confidence
-    (see --use_confidence_weighting).
+    with the same weight vector used for CrossEntropyLoss (--weight_param).
 
     Unlike raw IoU/Jaccard loss, Dice's gradient is gentler on
     near-empty-overlap (rare-class) pixels, which tends to train more
@@ -192,7 +166,7 @@ class DiceLoss(nn.Module):
         self.ignore_index = ignore_index
         self.smooth = smooth
 
-    def forward(self, logits, targets, pixel_weight=None):
+    def forward(self, logits, targets):
         probs = F.softmax(logits, dim=1)  # (B, C, H, W)
 
         valid = (targets != self.ignore_index)
@@ -200,15 +174,13 @@ class DiceLoss(nn.Module):
         targets_clamped[~valid] = 0  # placeholder class, masked out below
         one_hot = F.one_hot(targets_clamped, self.num_classes).permute(0, 3, 1, 2).float()
 
-        valid_f = valid.unsqueeze(1).float()
-        # A single weight factor applied consistently to the intersection
-        # AND both union terms below (not pre-multiplied into probs/one_hot
-        # separately, which would double-count it in the intersection term).
-        w = valid_f if pixel_weight is None else valid_f * pixel_weight.unsqueeze(1)
+        valid = valid.unsqueeze(1).float()
+        probs = probs * valid
+        one_hot = one_hot * valid
 
         dims = (0, 2, 3)
-        intersection = (w * probs * one_hot).sum(dims)
-        union = (w * probs).sum(dims) + (w * one_hot).sum(dims)
+        intersection = (probs * one_hot).sum(dims)
+        union = probs.sum(dims) + one_hot.sum(dims)
         dice_per_class = (2 * intersection + self.smooth) / (union + self.smooth)
 
         if self.weight is not None:
@@ -221,13 +193,12 @@ class CEDiceLoss(nn.Module):
 
     def __init__(self, num_classes, weight=None, ignore_index=-1, dice_weight=0.5):
         super().__init__()
-        self.ce = ConfidenceWeightedCE(weight=weight, ignore_index=ignore_index)
+        self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='mean', weight=weight)
         self.dice = DiceLoss(num_classes, weight=weight, ignore_index=ignore_index)
         self.dice_weight = dice_weight
 
-    def forward(self, logits, targets, pixel_weight=None):
-        return self.ce(logits, targets, pixel_weight=pixel_weight) \
-            + self.dice_weight * self.dice(logits, targets, pixel_weight=pixel_weight)
+    def forward(self, logits, targets):
+        return self.ce(logits, targets) + self.dice_weight * self.dice(logits, targets)
 
 
 def build_param_groups(model, base_lr, encoder_lr_mult, weight_decay):
@@ -325,9 +296,9 @@ def main(options):
     standardization = transforms.Normalize(BANDS_MEAN, BANDS_STD)
 
     if options['mode'] == 'train':
-        splits_dir = os.path.join(DATASET_PATH, 'splits')
-        train_rois_raw = np.genfromtxt(os.path.join(splits_dir, 'train_X.txt'), dtype='str')
-        val_rois_raw = np.genfromtxt(os.path.join(splits_dir, 'val_X.txt'), dtype='str')
+        splits_path = os.path.join(DATASET_PATH, options['splits_dir'])
+        train_rois_raw = np.genfromtxt(os.path.join(splits_path, 'train_X.txt'), dtype='str')
+        val_rois_raw = np.genfromtxt(os.path.join(splits_path, 'val_X.txt'), dtype='str')
 
         logging.info(
             "Patches before augmentation - train: %d, val: %d",
@@ -349,7 +320,6 @@ def main(options):
             spectral_jitter_strength=options['spectral_jitter_strength'],
             use_spectral_indices=options['use_spectral_indices'],
             use_texture_features=options['use_texture_features'],
-            use_confidence_weighting=options['use_confidence_weighting'],
             splits_dir=options['splits_dir'],
         )
         val_dataset = GenDEBRIS(
@@ -357,15 +327,13 @@ def main(options):
             agg_to_water=options['agg_to_water'],
             use_spectral_indices=options['use_spectral_indices'],
             use_texture_features=options['use_texture_features'],
-            use_confidence_weighting=options['use_confidence_weighting'],
             splits_dir=options['splits_dir'],
             # No rare_classes / copy_paste_prob / spectral_jitter_prob here:
-            # those are train-only augmentations. use_spectral_indices,
-            # use_texture_features, and use_confidence_weighting are all
-            # feature/loss representations, not augmentations, so they
-            # MUST match train -- val/test need the same input channels
-            # and (if enabled) confidence weights as what the model was
-            # built and trained with.
+            # those are train-only augmentations. use_spectral_indices and
+            # use_texture_features are feature representations, not
+            # augmentations, so they MUST match train -- val/test need
+            # the same input channels as what the model was built and
+            # trained with.
         )
 
         logging.info(
@@ -439,7 +407,6 @@ def main(options):
             agg_to_water=options['agg_to_water'],
             use_spectral_indices=options['use_spectral_indices'],
             use_texture_features=options['use_texture_features'],
-            use_confidence_weighting=options['use_confidence_weighting'],
             splits_dir=options['splits_dir'],
         )
         num_input_channels = test_dataset.num_channels
@@ -531,7 +498,7 @@ def main(options):
                                 ignore_index=-1, dice_weight=options['dice_weight'])
         logging.info("Using CrossEntropy + %.2f * Dice Loss", options['dice_weight'])
     else:
-        criterion = ConfidenceWeightedCE(weight=weight, ignore_index=-1)
+        criterion = nn.CrossEntropyLoss(ignore_index=-1, reduction='mean', weight=weight)
         logging.info("Using CrossEntropy Loss")
 
     if options['encoder_lr_mult'] != 1.0:
@@ -569,19 +536,13 @@ def main(options):
             train_losses = []
             train_samples = 0
 
-            for batch_idx, batch in enumerate(tqdm(train_loader, desc="training")):
-                if options['use_confidence_weighting']:
-                    images, targets, pixel_weight = batch
-                    pixel_weight = pixel_weight.to(device)
-                else:
-                    images, targets = batch
-                    pixel_weight = None
+            for batch_idx, (images, targets) in enumerate(tqdm(train_loader, desc="training")):
                 images = images.to(device)
                 targets = targets.to(device)
 
                 optimizer.zero_grad()
                 logits = model(images)
-                loss = criterion(logits, targets, pixel_weight=pixel_weight)
+                loss = criterion(logits, targets)
                 loss.backward()
 
                 if options['grad_clip'] > 0:
@@ -611,18 +572,12 @@ def main(options):
                 y_pred = []
 
                 with torch.no_grad():
-                    for batch in tqdm(val_loader, desc="testing"):
-                        if options['use_confidence_weighting']:
-                            images, targets, pixel_weight = batch
-                            pixel_weight = pixel_weight.to(device)
-                        else:
-                            images, targets = batch
-                            pixel_weight = None
+                    for images, targets in tqdm(val_loader, desc="testing"):
                         images = images.to(device)
                         targets = targets.to(device)
 
                         logits = model(images)
-                        loss = criterion(logits, targets, pixel_weight=pixel_weight)
+                        loss = criterion(logits, targets)
 
                         logits = logits.permute(0, 2, 3, 1).reshape(-1, options['output_channels'])
                         targets_flat = targets.reshape(-1)
@@ -725,18 +680,12 @@ def main(options):
         y_pred = []
 
         with torch.no_grad():
-            for batch in tqdm(test_loader, desc="testing"):
-                if options['use_confidence_weighting']:
-                    images, targets, pixel_weight = batch
-                    pixel_weight = pixel_weight.to(device)
-                else:
-                    images, targets = batch
-                    pixel_weight = None
+            for images, targets in tqdm(test_loader, desc="testing"):
                 images = images.to(device)
                 targets = targets.to(device)
 
                 logits = model(images)
-                loss = criterion(logits, targets, pixel_weight=pixel_weight)
+                loss = criterion(logits, targets)
 
                 logits = logits.permute(0, 2, 3, 1).reshape(-1, options['output_channels'])
                 targets_flat = targets.reshape(-1)
@@ -826,17 +775,6 @@ if __name__ == "__main__":
                               'informative feature for their winning RF variant. Applies to '
                               'train/val/test identically. Can be combined with '
                               '--use_spectral_indices.')
-    parser.add_argument('--use_confidence_weighting', default=False, type=bool,
-                         help="Weight each pixel's contribution to the loss by its MARIDA "
-                              "annotation confidence level (1=high/2=moderate/3=low -> weights "
-                              "1, 2/3, 1/3), matching the scheme MARIDA used for their RF "
-                              "baseline. REQUIRES a '{name}_conf.tif' confidence raster next to "
-                              "each '{name}_cl.tif' mask file -- this naming convention is an "
-                              "ASSUMPTION, not verified against a real MARIDA download; if your "
-                              "data uses a different layout, this silently falls back to uniform "
-                              "weighting for the affected patches (see the startup warning) "
-                              "rather than crashing, so double-check the log before trusting "
-                              "results. Applies to train/val/test identically.")
     parser.add_argument('--output_channels', default=11, type=int, help='Number of output classes')
     parser.add_argument('--weight_param', default=1.03, type=float,
                         help='Weighting parameter for Loss Function')
