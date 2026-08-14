@@ -97,7 +97,8 @@ def compute_mados_class_distribution(train_dataset):
 
     counts = np.zeros(NUM_CLASSES, dtype=np.int64)
     for roi in tqdm(train_dataset.rois, desc="Scanning MADOS train masks for class distribution"):
-        mask_path = os.path.join(train_dataset.mados_path, 'patches', f'{roi}_cl.tif')
+        scene_id, crop_id = roi.rsplit('_', 1)
+        mask_path = os.path.join(train_dataset.mados_path, scene_id, f'{scene_id}_L2R_cl_{crop_id}.tif')
         ds = train_dataset._gdal.Open(mask_path)
         if ds is None:
             continue
@@ -186,13 +187,13 @@ def main(options):
         options['mados_path'], split='train', transform=transform_train,
         use_spectral_indices=options['use_spectral_indices'],
         use_texture_features=options['use_texture_features'],
-        standardization=standardization,
+        standardization=standardization, splits_path=options['splits_path'],
     )
     val_dataset = MADOSDataset(
         options['mados_path'], split='val', transform=transform_val,
         use_spectral_indices=options['use_spectral_indices'],
         use_texture_features=options['use_texture_features'],
-        standardization=standardization,
+        standardization=standardization, splits_path=options['splits_path'],
     )
     print(f"Loaded {len(train_dataset)} MADOS train patches, {len(val_dataset)} val patches.")
     logging.info("Loaded %d train / %d val MADOS patches.", len(train_dataset), len(val_dataset))
@@ -331,7 +332,16 @@ def main(options):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--mados_path', required=True, help='Root MADOS directory')
+    parser.add_argument('--mados_path', required=True,
+                         help="Path to the STACKED MADOS data (i.e. the '<something>_nearest' "
+                              "folder produced by MADOS's own utils/stack_patches.py -- e.g. "
+                              "MADOS_nearest, NOT the original raw MADOS/ folder).")
+    parser.add_argument('--splits_path', default=None,
+                         help="Path to the folder containing {train,val,test}_X.txt. Defaults "
+                              "to '<mados_path>/splits' if not given, but splits/ is normally "
+                              "only created in the ORIGINAL (unstacked) MADOS/ folder, not in "
+                              "the stacked MADOS_nearest/ folder -- so this usually needs to be "
+                              "set explicitly, e.g. --splits_path /path/to/MADOS/splits.")
     parser.add_argument('--variant', default='baseline',
                          choices=['baseline', '+dilated', '+dilated+attention', 'full',
                                   'only_dilated', 'only_attention', 'only_residual'])

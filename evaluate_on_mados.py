@@ -168,7 +168,7 @@ def main(options):
             options['mados_path'], split=options['mados_split'], transform=transform_deterministic,
             use_spectral_indices=options['use_spectral_indices'],
             use_texture_features=options['use_texture_features'],
-            standardization=standardization,
+            standardization=standardization, splits_path=options['mados_splits_path'],
         )
         print(f"Loaded {len(dataset)} MADOS patches (split={options['mados_split']}).")
     else:
@@ -257,11 +257,18 @@ if __name__ == '__main__':
                               "(same as evaluation_swin_unetv2.py). 'mados' = cross-dataset "
                               "generalization check on MADOS, remapped to MARIDA's label space.")
     parser.add_argument('--mados_path', default=None,
-                         help='Root MADOS directory. Required when --dataset mados.')
+                         help="Path to the STACKED MADOS data (the '<something>_nearest' "
+                              "folder produced by stack_patches.py). Required when --dataset mados.")
     parser.add_argument('--mados_split', default='test',
-                         help="MADOS split name under <mados_path>/splits/ -- resolves to "
+                         help="MADOS split name under --mados_splits_path -- resolves to "
                               "'<name>_X.txt' (e.g. 'test' -> test_X.txt), confirmed to match "
                               "MARIDA's own splits/ naming convention.")
+    parser.add_argument('--mados_splits_path', default=None,
+                         help="Path to the folder containing MADOS's {train,val,test}_X.txt. "
+                              "Defaults to '<mados_path>/splits' if not given, but splits/ is "
+                              "normally only created in the ORIGINAL (unstacked) MADOS/ folder, "
+                              "not the stacked MADOS_nearest/ folder -- usually needs to be set "
+                              "explicitly, e.g. --mados_splits_path /path/to/MADOS/splits.")
     parser.add_argument('--splits_dir', default='splits', type=str,
                          help="MARIDA splits subfolder. Only used when --dataset marida -- "
                               "must match whatever the checkpoint was trained/evaluated with "
