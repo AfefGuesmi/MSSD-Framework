@@ -84,7 +84,7 @@ import sys
 import numpy as np
 import torch
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -95,7 +95,9 @@ from utils.config import Config
 from mssd_net import build_mssd_net
 from dataloader import (
     GenDEBRIS, BANDS_MEAN, BANDS_STD, SPECTRAL_INDEX_NAMES, TEXTURE_FEATURE_NAMES,
-    compute_spectral_indices, compute_texture_features,
+)
+from mados_dataloader import (
+    MADOSDataset, MARIDA_LABELS, MARIDA_CLASSES_NOT_IN_MADOS,
 )
 from utils.metrics import Evaluation
 
@@ -107,184 +109,6 @@ except ImportError:
 from evaluation_swin_unetv2 import tta_predict, per_class_report, format_report
 
 os.makedirs(os.path.join(PROJECT_ROOT, 'logs'), exist_ok=True)
-
-MADOS_PATCH_SIZE = 240  # PANGAEA-confirmed; change if your download differs
-
-# MARIDA's 11 output classes, in the exact order your model was trained
-# to predict (matches ALL_LABELS[:11] / agg_to_water=True in dataloader.py).
-MARIDA_LABELS = [
-    'Marine Debris', 'Dense Sargassum', 'Sparse Sargassum',
-    'Natural Organic Material', 'Ship', 'Clouds', 'Marine Water',
-    'Sediment-Laden Water', 'Foam', 'Turbid Water', 'Shallow Water',
-]
-
-# MADOS's 15 classes, 1-indexed as they appear in the raw mask rasters
-# (index 0 in this list = mask value 1, etc.) -- see VERIFIED note above.
-MADOS_LABELS = [
-    'Marine Debris', 'Oil Spills', 'Dense Sargassum', 'Sparse Floating Algae',
-    'Natural Organic Material', 'Ships', 'Marine Water', 'Sediment-Laden Water',
-    'Foam', 'Turbid Water', 'Shallow Water', 'Waves and Wakes',
-    'Oil Platforms', 'Jellyfish Aggregations', 'Sea Snot',
-]
-
-# Crosswalk: MADOS class index (0-indexed into MADOS_LABELS) -> MARIDA
-# class index (0-indexed into MARIDA_LABELS), or None if MADOS has no
-# equivalent MARIDA class (these pixels become ignore_index=-1, i.e.
-# excluded from evaluation entirely rather than guessed-at).
-#
-#   MADOS class            -> MARIDA class            -> reasoning
-#   Marine Debris          -> Marine Debris               direct match
-#   Oil Spills              -> None (ignored)              no MARIDA equivalent
-#   Dense Sargassum          -> Dense Sargassum             direct match
-#   Sparse Floating Algae    -> Sparse Sargassum            same concept, renamed
-#   Natural Organic Material -> Natural Organic Material    direct match
-#   Ships                     -> Ship                        direct match
-#   Marine Water             -> Marine Water                direct match
-#   Sediment-Laden Water     -> Sediment-Laden Water        direct match
-#   Foam                       -> Foam                        direct match
-#   Turbid Water              -> Turbid Water                direct match
-#   Shallow Water             -> Shallow Water               direct match
-#   Waves and Wakes           -> Marine Water                matches MARIDA's own
-#                                                            agg_to_water=True logic,
-#                                                            which folds Waves/Wakes
-#                                                            into Marine Water
-#   Oil Platforms              -> None (ignored)              no MARIDA equivalent
-#   Jellyfish Aggregations     -> None (ignored)              no MARIDA equivalent
-#   Sea Snot                   -> None (ignored)              no MARIDA equivalent
-MADOS_TO_MARIDA = {
-    0: 0,    # Marine Debris -> Marine Debris
-    1: None,  # Oil Spills -> ignored
-    2: 1,    # Dense Sargassum -> Dense Sargassum
-    3: 2,    # Sparse Floating Algae -> Sparse Sargassum
-    4: 3,    # Natural Organic Material -> Natural Organic Material
-    5: 4,    # Ships -> Ship
-    6: 6,    # Marine Water -> Marine Water
-    7: 7,    # Sediment-Laden Water -> Sediment-Laden Water
-    8: 8,    # Foam -> Foam
-    9: 9,    # Turbid Water -> Turbid Water
-    10: 10,  # Shallow Water -> Shallow Water
-    11: 6,   # Waves and Wakes -> Marine Water (matches MARIDA's own agg_to_water)
-    12: None,  # Oil Platforms -> ignored
-    13: None,  # Jellyfish Aggregations -> ignored
-    14: None,  # Sea Snot -> ignored
-}
-
-# MARIDA classes that MADOS cannot test at all (no equivalent in its
-# label set) -- excluded from the macro average computed here, reported
-# separately instead of silently scored as 0%.
-MARIDA_CLASSES_NOT_IN_MADOS = ['Clouds']
-
-
-def remap_mados_mask(mados_mask):
-    """
-    Convert a raw MADOS mask (1-indexed class codes, 0/background/void as
-    needed) into MARIDA's 0-indexed 11-class label space, using
-    MADOS_TO_MARIDA. Unmapped classes and anything outside the valid
-    MADOS range become -1 (ignore_index), matching how MARIDA's own
-    masks already encode "don't evaluate this pixel".
-    """
-    remapped = np.full_like(mados_mask, -1)
-    for mados_idx, marida_idx in MADOS_TO_MARIDA.items():
-        if marida_idx is not None:
-            remapped[mados_mask == (mados_idx + 1)] = marida_idx  # +1: MADOS masks are 1-indexed
-    return remapped
-
-
-class MADOSDataset(Dataset):
-    """
-    Minimal MADOS loader: reads already-stacked <name>.tif / <name>_cl.tif
-    pairs (see the NOT VERIFIED note at the top of this file regarding
-    this file-naming assumption), remaps labels to MARIDA's space via
-    remap_mados_mask, optionally computes the same spectral-index/texture
-    extra channels your model was trained with, and center-crops/pads to
-    256x256 to match MARIDA's patch size.
-    """
-
-    def __init__(self, mados_path, split='test', use_spectral_indices=False,
-                 use_texture_features=False, standardization=None):
-        from osgeo import gdal
-
-        self._gdal = gdal
-        self.mados_path = mados_path
-        self.use_spectral_indices = use_spectral_indices
-        self.use_texture_features = use_texture_features
-        self.standardization = standardization
-        self.n_raw_bands = len(BANDS_MEAN)
-
-        split_file = os.path.join(mados_path, 'splits', f'{split}.txt')
-        if not os.path.exists(split_file):
-            raise FileNotFoundError(
-                f"Could not find {split_file}. This script assumes a MADOS split file layout "
-                f"similar to MARIDA's -- check your actual MADOS download structure and adjust "
-                f"this path (and the patch-file naming below) to match."
-            )
-        with open(split_file) as f:
-            self.rois = [line.strip() for line in f if line.strip()]
-
-    def __len__(self):
-        return len(self.rois)
-
-    def __getitem__(self, index):
-        roi = self.rois[index]
-        img_path = os.path.join(self.mados_path, 'patches', f'{roi}.tif')
-        mask_path = os.path.join(self.mados_path, 'patches', f'{roi}_cl.tif')
-
-        ds = self._gdal.Open(img_path)
-        img = ds.ReadAsArray().astype(np.float32)  # (C, H, W)
-        ds = None
-
-        ds = self._gdal.Open(mask_path)
-        mask = ds.ReadAsArray().astype(np.int64)  # (H, W), MADOS's raw 1-indexed codes
-        ds = None
-
-        mask = remap_mados_mask(mask)
-
-        # Center pad/crop 240x240 -> 256x256 to match MARIDA's patch size.
-        img = np.moveaxis(img, 0, -1)  # (H, W, C)
-        img, mask = self._resize_to_256(img, mask)
-
-        nan_mask = np.isnan(img)
-        band_means = np.tile(BANDS_MEAN, (img.shape[0], img.shape[1], 1))
-        img[nan_mask] = band_means[nan_mask]
-
-        if self.use_spectral_indices or self.use_texture_features:
-            parts = []
-            if self.use_spectral_indices:
-                parts.append(compute_spectral_indices(img))
-            if self.use_texture_features:
-                parts.append(compute_texture_features(img))
-            img = np.concatenate([img] + parts, axis=-1)
-
-        img = torch.from_numpy(np.moveaxis(img, -1, 0).astype(np.float32))
-        mask = torch.from_numpy(mask)
-
-        if self.use_spectral_indices or self.use_texture_features:
-            raw = img[:self.n_raw_bands]
-            extra = img[self.n_raw_bands:]
-            if self.standardization is not None:
-                raw = self.standardization(raw)
-            img = torch.cat([raw, extra], dim=0)
-        elif self.standardization is not None:
-            img = self.standardization(img)
-
-        return img, mask
-
-    @staticmethod
-    def _resize_to_256(img, mask, target=256):
-        h, w = mask.shape
-        if h == target and w == target:
-            return img, mask
-        pad_h, pad_w = max(0, target - h), max(0, target - w)
-        if pad_h > 0 or pad_w > 0:
-            img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode='reflect')
-            mask = np.pad(mask, ((0, pad_h), (0, pad_w)), constant_values=-1)
-        h2, w2 = mask.shape[:2]
-        if h2 > target or w2 > target:
-            top = (h2 - target) // 2
-            left = (w2 - target) // 2
-            img = img[top:top + target, left:left + target]
-            mask = mask[top:top + target, left:left + target]
-        return img, mask
 
 
 def build_model(options, device):
@@ -337,17 +161,18 @@ def main(options):
     model.eval()
 
     standardization = transforms.Normalize(BANDS_MEAN, BANDS_STD)
+    transform_deterministic = transforms.Compose([transforms.ToTensor()])
 
     if is_mados:
         dataset = MADOSDataset(
-            options['mados_path'], split=options['mados_split'],
+            options['mados_path'], split=options['mados_split'], transform=transform_deterministic,
             use_spectral_indices=options['use_spectral_indices'],
             use_texture_features=options['use_texture_features'],
             standardization=standardization,
         )
         print(f"Loaded {len(dataset)} MADOS patches (split={options['mados_split']}).")
     else:
-        transform_test = transforms.Compose([transforms.ToTensor()])
+        transform_test = transform_deterministic
         dataset = GenDEBRIS(
             'test', transform=transform_test, standardization=standardization,
             agg_to_water=options['agg_to_water'],
@@ -433,7 +258,10 @@ if __name__ == '__main__':
                               "generalization check on MADOS, remapped to MARIDA's label space.")
     parser.add_argument('--mados_path', default=None,
                          help='Root MADOS directory. Required when --dataset mados.')
-    parser.add_argument('--mados_split', default='test', help="MADOS split file name under <mados_path>/splits/")
+    parser.add_argument('--mados_split', default='test',
+                         help="MADOS split name under <mados_path>/splits/ -- resolves to "
+                              "'<name>_X.txt' (e.g. 'test' -> test_X.txt), confirmed to match "
+                              "MARIDA's own splits/ naming convention.")
     parser.add_argument('--splits_dir', default='splits', type=str,
                          help="MARIDA splits subfolder. Only used when --dataset marida -- "
                               "must match whatever the checkpoint was trained/evaluated with "

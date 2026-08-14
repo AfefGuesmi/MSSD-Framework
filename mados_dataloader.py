@@ -17,7 +17,8 @@ one.
 VERIFIED vs. UNVERIFIED -- read before trusting any output
 ======================================================================
 
-VERIFIED (cross-checked against 2+ independent published sources):
+VERIFIED (cross-checked against 2+ independent published sources, OR
+directly confirmed against a real MADOS download):
   - MADOS's 15-class list and their 1-indexed order (see MADOS_LABELS
     below) -- confirmed by a Frontiers paper doing MARIDA+MADOS merging
     (which explicitly lists all 15 in order) AND independently by a
@@ -30,17 +31,27 @@ VERIFIED (cross-checked against 2+ independent published sources):
     confirmed via PANGAEA. This module center-crops/pads to 256x256 to
     match your model's expected input; adjust MADOS_PATCH_SIZE below if
     this is wrong for your actual download.
+  - Split file naming: CONFIRMED against a real MADOS download --
+    <mados_path>/splits/{train,val,test}_X.txt, reusing MARIDA's exact
+    naming convention (not train.txt/val.txt/test.txt as an earlier
+    version of this file assumed).
+  - The official scene-level train/val/test split also exists in
+    MADOS's separately-distributed dataset.h5 (per-pixel spectral
+    signature table, keys '/Train'/'/Validation'/'/Test', with a
+    'Scene' column giving 174 total scenes: 96 train / 36 val / 42
+    test) -- consistent with, and a useful cross-check against, the
+    splits/*_X.txt files.
 
 NOT VERIFIED -- please confirm on your actual download before trusting
 results, same discipline as the confidence-raster naming issue earlier:
-  - The exact file/folder naming convention for MADOS patches once
+  - The exact file naming for MADOS patches under patches/ once
     downloaded and "stacked" (their own README describes a required
     `utils/stack_patches.py` step to combine raw per-band rasters into
     a single multiband GeoTIFF per patch -- this module assumes that
     step has already been run and produces `<name>.tif` / `<name>_cl.tif`
-    pairs in the same style as MARIDA's dataloader, but this is an
-    ASSUMPTION based on the MARIDA-derived codebase pattern, not a
-    confirmed file listing).
+    pairs, matching the confirmed splits/*_X.txt naming pattern, but
+    the patches/ folder's exact file naming itself has not yet been
+    independently confirmed the way splits/ has).
   - Whether MADOS's raster mask values are 1-indexed the same way
     MARIDA's are.
   - Band statistics (BANDS_MEAN/BANDS_STD): reused directly from
@@ -195,7 +206,10 @@ class MADOSDataset(Dataset):
         self.standardization = standardization
         self.n_raw_bands = len(BANDS_MEAN)
 
-        split_file = os.path.join(mados_path, 'splits', f'{split}.txt')
+        # CONFIRMED against real data: MADOS reuses MARIDA's exact splits/
+        # naming convention -- train_X.txt / val_X.txt / test_X.txt, not
+        # train.txt / val.txt / test.txt.
+        split_file = os.path.join(mados_path, 'splits', f'{split}_X.txt')
         if not os.path.exists(split_file):
             raise FileNotFoundError(
                 f"Could not find {split_file}. This module assumes a MADOS split file layout "
