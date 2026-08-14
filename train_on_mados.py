@@ -299,15 +299,29 @@ def main(options):
             if current_score > best_score:
                 best_score = current_score
                 early_stop_counter = 0
-                save_dir = os.path.join(checkpoint_dir, str(epoch))
-                os.makedirs(save_dir, exist_ok=True)
-                save_path = os.path.join(save_dir, 'best_model.pth')
+                save_path = os.path.join(checkpoint_dir, 'best_model.pth')
+                backup_path = os.path.join(checkpoint_dir, 'best_model_prev.pth')
+                # Keep one step-back safety copy (in case a save gets
+                # interrupted mid-write) without letting checkpoints
+                # accumulate across every improving epoch -- the old
+                # per-epoch-folder scheme filled Kaggle's disk quota by
+                # epoch 200 on a long run and crashed torch.save() mid-write.
+                if os.path.exists(save_path):
+                    try:
+                        os.replace(save_path, backup_path)
+                    except OSError:
+                        pass  # non-fatal; proceed to overwrite save_path anyway
                 torch.save(model.state_dict(), save_path)
-                logging.info("Best model improved (macroF1 excl. Clouds = %.4f, mIoU excl. Clouds = %.4f). Saved to: %s",
-                              current_score, current_iou, save_path)
-                print(f"Best model saved to: {save_path}")
+                logging.info("Best model improved (macroF1 excl. Clouds = %.4f, mIoU excl. Clouds = %.4f) "
+                              "at epoch %d. Saved to: %s",
+                              current_score, current_iou, epoch, save_path)
+                print(f"Best model (epoch {epoch}) saved to: {save_path}")
             else:
                 early_stop_counter += 1
+                logging.info("No improvement for %d/%d epochs (best so far: macroF1=%.4f at an earlier epoch).",
+                              early_stop_counter, options['patience'], best_score)
+                print(f"No improvement for {early_stop_counter}/{options['patience']} epochs "
+                      f"(best so far: macroF1={best_score:.4f}).")
                 if early_stop_counter >= options['patience']:
                     logging.info("Early stopping triggered after epoch %d.", epoch)
                     print("Early stopping triggered.")
