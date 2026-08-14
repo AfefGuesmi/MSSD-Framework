@@ -121,26 +121,6 @@ def compute_mados_class_distribution(train_dataset):
     return torch.tensor(distribution, dtype=torch.float32)
 
 
-def evaluate_split(model, loader, device, options):
-    model.eval()
-    y_true, y_pred = [], []
-    with torch.no_grad():
-        for images, targets in loader:
-            images, targets = images.to(device), targets.to(device)
-            logits = model(images)
-            probs = torch.nn.functional.softmax(logits, dim=1)
-            probs = torch.movedim(probs, 1, -1).reshape(-1, NUM_CLASSES)
-            targets = targets.reshape(-1)
-            mask = targets != -1
-            probs, targets = probs[mask], targets[mask]
-            y_pred += probs.cpu().numpy().argmax(1).tolist()
-            y_true += targets.cpu().numpy().tolist()
-    model.train()
-    if not y_true:
-        return None
-    return Evaluation(y_pred, y_true)
-
-
 def macro_f1_excluding_clouds(metrics_dict, y_true=None, y_pred=None):
     """
     Checkpoint-selection metric: Macro F1 computed EXCLUDING Clouds,
@@ -156,6 +136,19 @@ def macro_f1_excluding_clouds(metrics_dict, y_true=None, y_pred=None):
     from sklearn.metrics import f1_score
     testable_labels = [i for i in range(NUM_CLASSES) if i != CLOUDS_INDEX]
     return f1_score(y_true, y_pred, labels=testable_labels, average='macro', zero_division=0)
+
+
+def macro_iou_excluding_clouds(y_true, y_pred):
+    """
+    Same idea as macro_f1_excluding_clouds, but for mIoU -- reported
+    alongside Macro F1 at every validation step, since IoU is the
+    project's other headline metric throughout (matching
+    evaluate_on_mados.py's macro_iou_excluding_clouds output) and was
+    previously missing from this script's per-epoch training log.
+    """
+    from sklearn.metrics import jaccard_score
+    testable_labels = [i for i in range(NUM_CLASSES) if i != CLOUDS_INDEX]
+    return jaccard_score(y_true, y_pred, labels=testable_labels, average='macro', zero_division=0)
 
 
 def main(options):
@@ -296,10 +289,12 @@ def main(options):
                 continue
 
             current_score = macro_f1_excluding_clouds(None, y_true, y_pred)
-            logging.info("Epoch %d - Train loss: %.4f - Val macroF1 (excl. Clouds): %.4f",
-                          epoch, avg_train_loss, current_score)
+            current_iou = macro_iou_excluding_clouds(y_true, y_pred)
+            logging.info("Epoch %d - Train loss: %.4f - Val macroF1 (excl. Clouds): %.4f - Val mIoU (excl. Clouds): %.4f",
+                          epoch, avg_train_loss, current_score, current_iou)
             print(f"Epoch {epoch} - Train loss: {avg_train_loss:.4f} - "
-                  f"Val macroF1 (excl. Clouds): {current_score:.4f}")
+                  f"Val macroF1 (excl. Clouds): {current_score:.4f} - "
+                  f"Val mIoU (excl. Clouds): {current_iou:.4f}")
 
             if current_score > best_score:
                 best_score = current_score
@@ -308,8 +303,8 @@ def main(options):
                 os.makedirs(save_dir, exist_ok=True)
                 save_path = os.path.join(save_dir, 'best_model.pth')
                 torch.save(model.state_dict(), save_path)
-                logging.info("Best model improved (macroF1 excl. Clouds = %.4f). Saved to: %s",
-                              current_score, save_path)
+                logging.info("Best model improved (macroF1 excl. Clouds = %.4f, mIoU excl. Clouds = %.4f). Saved to: %s",
+                              current_score, current_iou, save_path)
                 print(f"Best model saved to: {save_path}")
             else:
                 early_stop_counter += 1
