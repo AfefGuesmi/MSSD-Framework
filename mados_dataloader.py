@@ -71,7 +71,9 @@ accordingly (checkpoint selection, reported metrics), rather than
 silently scoring it as 0% or crashing.
 """
 
+import logging
 import os
+import random
 
 import numpy as np
 import torch
@@ -95,37 +97,63 @@ MARIDA_LABELS = [
 # MADOS's 15 classes, 1-indexed as they appear in the raw mask rasters
 # (index 0 in this list = mask value 1, etc.) -- see VERIFIED note above.
 MADOS_LABELS = [
-    'Marine Debris', 'Oil Spills', 'Dense Sargassum', 'Sparse Floating Algae',
-    'Natural Organic Material', 'Ships', 'Marine Water', 'Sediment-Laden Water',
-    'Foam', 'Turbid Water', 'Shallow Water', 'Waves and Wakes',
+    'Marine Debris', 'Dense Sargassum', 'Sparse Floating Algae', 'Natural Organic Material',
+    'Ships', 'Oil Spills', 'Marine Water', 'Sediment-Laden Water',
+    'Foam', 'Turbid Water', 'Shallow Water', 'Waves',
     'Oil Platforms', 'Jellyfish Aggregations', 'Sea Snot',
 ]
-
+# CORRECTED against a direct screenshot of the actual published Table 5
+# header row (Kikaki et al., 2024) -- the previous order here had "Oil
+# Spills" in position 2 instead of position 6, shifting Dense Sargassum/
+# Sparse Floating Algae/Natural Organic Material/Ships each one position
+# earlier than they should be. This was a real, serious bug: it caused
+# real Dense Sargassum pixels (raw mask value 2) to be silently dropped
+# (mapped to the old, wrong "Oil Spills -> ignored" rule), and caused
+# Sparse Floating Algae/Natural Organic Material/Ships pixels to be
+# mistrained under the WRONG MARIDA class labels one position over, with
+# real Oil Spill pixels (raw value 6) incorrectly taught to the model as
+# "Ship". Any MADOS-trained checkpoint produced before this fix should be
+# considered invalid for classes 2-6 and retrained.
 # Crosswalk: MADOS class index (0-indexed into MADOS_LABELS) -> MARIDA
 # class index (0-indexed into MARIDA_LABELS), or None if MADOS has no
 # equivalent MARIDA class (these pixels become ignore_index=-1, i.e.
 # excluded from training/evaluation entirely rather than guessed-at).
+# Order CONFIRMED against a direct screenshot of the actual published
+# Table 5 header row (Kikaki et al., 2024).
 #
-#   MADOS class            -> MARIDA class            -> reasoning
-#   Marine Debris          -> Marine Debris               direct match
-#   Oil Spills              -> None (ignored)              no MARIDA equivalent
-#   Dense Sargassum          -> Dense Sargassum             direct match
-#   Sparse Floating Algae    -> Sparse Sargassum            same concept, renamed
-#   Natural Organic Material -> Natural Organic Material    direct match
-#   Ships                     -> Ship                        direct match
-#   Marine Water             -> Marine Water                direct match
-#   Sediment-Laden Water     -> Sediment-Laden Water        direct match
-#   Foam                       -> Foam                        direct match
-#   Turbid Water              -> Turbid Water                direct match
-#   Shallow Water             -> Shallow Water               direct match
-#   Waves and Wakes           -> Marine Water                matches MARIDA's own
-#                                                            agg_to_water=True logic
-#   Oil Platforms              -> None (ignored)              no MARIDA equivalent
-#   Jellyfish Aggregations     -> None (ignored)              no MARIDA equivalent
-#   Sea Snot                   -> None (ignored)              no MARIDA equivalent
+#   MADOS class (order)      -> MARIDA class            -> reasoning
+#   1. Marine Debris          -> Marine Debris               direct match
+#   2. Dense Sargassum         -> Dense Sargassum             direct match
+#   3. Sparse Floating Algae   -> Sparse Sargassum            same concept, renamed
+#   4. Natural Organic Material -> Natural Organic Material   direct match
+#   5. Ships                    -> Ship                        direct match
+#   6. Oil Spills                -> None (ignored)              no MARIDA equivalent
+#   7. Marine Water              -> Marine Water                direct match
+#   8. Sediment-Laden Water      -> Sediment-Laden Water        direct match
+#   9. Foam                       -> Foam                        direct match
+#   10. Turbid Water              -> Turbid Water                direct match
+#   11. Shallow Water             -> Shallow Water               direct match
+#   12. Waves                     -> Marine Water                matches MARIDA's own
+#                                                                agg_to_water=True logic
+#   13. Oil Platforms              -> None (ignored)              no MARIDA equivalent
+#   14. Jellyfish Aggregations     -> None (ignored)              no MARIDA equivalent
+#   15. Sea Snot                   -> None (ignored)              no MARIDA equivalent
 MADOS_TO_MARIDA = {
-    0: 0, 1: None, 2: 1, 3: 2, 4: 3, 5: 4, 6: 6, 7: 7, 8: 8, 9: 9, 10: 10,
-    11: 6, 12: None, 13: None, 14: None,
+    0: 0,    # Marine Debris -> Marine Debris
+    1: 1,    # Dense Sargassum -> Dense Sargassum
+    2: 2,    # Sparse Floating Algae -> Sparse Sargassum
+    3: 3,    # Natural Organic Material -> Natural Organic Material
+    4: 4,    # Ships -> Ship
+    5: None,  # Oil Spills -> ignored (no MARIDA equivalent)
+    6: 6,    # Marine Water -> Marine Water
+    7: 7,    # Sediment-Laden Water -> Sediment-Laden Water
+    8: 8,    # Foam -> Foam
+    9: 9,    # Turbid Water -> Turbid Water
+    10: 10,  # Shallow Water -> Shallow Water
+    11: 6,   # Waves -> Marine Water (matches MARIDA's own agg_to_water logic)
+    12: None,  # Oil Platforms -> ignored
+    13: None,  # Jellyfish Aggregations -> ignored
+    14: None,  # Sea Snot -> ignored
 }
 
 # MARIDA classes that MADOS cannot test/train at all (no equivalent in
@@ -191,11 +219,24 @@ class MADOSDataset(Dataset):
             deterministic val/test. Required (not optional), since
             ToTensor is what performs the numpy->tensor + HWC->CHW
             conversion.
+        rare_classes (list[int], optional): MARIDA-space class indices
+            (post-crosswalk, e.g. 2 = Sparse Sargassum) to treat as
+            copy-paste donors. Matches GenDEBRIS's --rare_classes
+            convention so the two pipelines stay consistent.
+        copy_paste_prob (float): probability of applying copy-paste to
+            a given training sample, matching MADOS's own VSCP (Very
+            Simple Copy-Paste) augmentation, confirmed to have been used
+            by MariNeXt's authors (Kikaki et al., 2024) to help with
+            exactly the same kind of severe rare-class imbalance you'd
+            see with Sparse Sargassum on this dataset. Should only be
+            set > 0 for the TRAIN split -- val/test must stay
+            deterministic.
     """
 
     def __init__(self, mados_path, split='train', transform=None,
                  use_spectral_indices=False, use_texture_features=False,
-                 standardization=None, splits_path=None):
+                 standardization=None, splits_path=None,
+                 rare_classes=None, copy_paste_prob=0.0):
         from osgeo import gdal
 
         self._gdal = gdal
@@ -227,20 +268,125 @@ class MADOSDataset(Dataset):
         with open(split_file) as f:
             self.rois = [line.strip() for line in f if line.strip()]
 
+        self.rare_classes = list(rare_classes) if rare_classes else []
+        self.copy_paste_prob = copy_paste_prob
+        self._rare_class_roi_indices = []
+        if self.copy_paste_prob > 0:
+            if not self.rare_classes:
+                logging.warning(
+                    "MADOSDataset(%s): copy_paste_prob=%.2f but rare_classes is empty -- "
+                    "copy-paste augmentation will be a no-op.", split, self.copy_paste_prob
+                )
+            else:
+                self._rare_class_roi_indices = self._index_rare_class_rois()
+                if not self._rare_class_roi_indices:
+                    logging.warning(
+                        "MADOSDataset(%s): no ROIs contain any of rare_classes=%s (in MARIDA "
+                        "label space) -- copy-paste augmentation will be a no-op.",
+                        split, self.rare_classes
+                    )
+                else:
+                    logging.info(
+                        "MADOSDataset(%s): copy-paste (VSCP-style) augmentation enabled "
+                        "(prob=%.2f), %d/%d ROIs available as donors for rare_classes=%s.",
+                        split, self.copy_paste_prob, len(self._rare_class_roi_indices),
+                        len(self.rois), self.rare_classes
+                    )
+
     def __len__(self):
         return len(self.rois)
 
-    def __getitem__(self, index):
-        roi = self.rois[index]
-        # CONFIRMED against real stacked data: ROI names are
-        # 'Scene_<scene_id>_<crop_id>' (e.g. 'Scene_54_30'). The stacked
-        # files live under Scene_<scene_id>/ with product-specific infixes:
-        #   Scene_<scene_id>_L2R_rhorc_<crop_id>.tif  -- stacked multiband image
-        #   Scene_<scene_id>_L2R_cl_<crop_id>.tif     -- class mask
-        # NOT a flat 'patches/<roi>.tif' layout like MARIDA's.
+    def _roi_to_paths(self, roi):
+        """Shared helper: ROI name -> (img_path, mask_path), matching __getitem__'s logic."""
         scene_id, crop_id = roi.rsplit('_', 1)
         img_path = os.path.join(self.mados_path, scene_id, f'{scene_id}_L2R_rhorc_{crop_id}.tif')
         mask_path = os.path.join(self.mados_path, scene_id, f'{scene_id}_L2R_cl_{crop_id}.tif')
+        return img_path, mask_path
+
+    def _index_rare_class_rois(self):
+        """
+        One-time scan (at construction) over every ROI's mask file to find
+        which ones contain at least one of self.rare_classes, AFTER
+        remapping to MARIDA's label space -- so --rare_classes uses the
+        same class-index convention as the rest of the pipeline (e.g. 2 =
+        Sparse Sargassum), not MADOS's raw 15-class codes. Unlike
+        GenDEBRIS, MADOSDataset doesn't preload every mask into memory, so
+        this reads each mask file once, here, rather than reusing an
+        already-loaded array.
+        """
+        donor_indices = []
+        for i, roi in enumerate(self.rois):
+            _, mask_path = self._roi_to_paths(roi)
+            ds = self._gdal.Open(mask_path)
+            if ds is None:
+                continue
+            raw_mask = ds.ReadAsArray().astype(np.int64)
+            ds = None
+            remapped = remap_mados_mask(raw_mask)
+            if np.isin(remapped, self.rare_classes).any():
+                donor_indices.append(i)
+        return donor_indices
+
+    def _copy_paste_rare_classes(self, img, mask):
+        """
+        Paste rare-class pixels from a randomly chosen donor ROI (one
+        known to contain at least one rare class, see
+        _index_rare_class_rois) onto (img, mask), at the same spatial
+        positions -- same VSCP-style idea as GenDEBRIS's copy-paste for
+        MARIDA. The donor is loaded fresh here (lazily), matching
+        MADOSDataset's overall lazy-loading design.
+
+        Args:
+            img (np.ndarray): (H, W, C) image, already NaN-imputed and
+                resized to 256x256, with any extra channels (spectral
+                indices/texture) already appended if enabled.
+            mask (np.ndarray): (H, W) MARIDA-space integer class labels
+                (already remapped + resized), -1 = ignore.
+
+        Returns:
+            (np.ndarray, np.ndarray): augmented (img, mask), same shapes.
+        """
+        donor_idx = random.choice(self._rare_class_roi_indices)
+        donor_roi = self.rois[donor_idx]
+        donor_img_path, donor_mask_path = self._roi_to_paths(donor_roi)
+
+        ds = self._gdal.Open(donor_img_path)
+        donor_img = ds.ReadAsArray().astype(np.float32)  # (C, H, W)
+        ds = None
+        donor_img = np.moveaxis(donor_img, 0, -1)  # (H, W, C)
+
+        ds = self._gdal.Open(donor_mask_path)
+        donor_mask_raw = ds.ReadAsArray().astype(np.int64)
+        ds = None
+        donor_mask = remap_mados_mask(donor_mask_raw)
+
+        donor_img, donor_mask = resize_to_256(donor_img, donor_mask)
+
+        donor_nan_mask = np.isnan(donor_img)
+        band_means = np.tile(BANDS_MEAN, (donor_img.shape[0], donor_img.shape[1], 1))
+        donor_img[donor_nan_mask] = band_means[donor_nan_mask]
+
+        if self.use_spectral_indices or self.use_texture_features:
+            parts = []
+            if self.use_spectral_indices:
+                parts.append(compute_spectral_indices(donor_img))
+            if self.use_texture_features:
+                parts.append(compute_texture_features(donor_img))
+            donor_img = np.concatenate([donor_img] + parts, axis=-1)
+
+        paste_mask = np.isin(donor_mask, self.rare_classes)
+        if not paste_mask.any():
+            return img, mask  # shouldn't happen given _rare_class_roi_indices, but stay safe
+
+        img = img.copy()
+        mask = mask.copy()
+        img[paste_mask] = donor_img[paste_mask]
+        mask[paste_mask] = donor_mask[paste_mask]
+        return img, mask
+
+    def __getitem__(self, index):
+        roi = self.rois[index]
+        img_path, mask_path = self._roi_to_paths(roi)
 
         ds = self._gdal.Open(img_path)
         img = ds.ReadAsArray().astype(np.float32)  # (C, H, W)
@@ -266,6 +412,13 @@ class MADOSDataset(Dataset):
             if self.use_texture_features:
                 parts.append(compute_texture_features(img))
             img = np.concatenate([img] + parts, axis=-1)
+
+        # ---- Copy-paste (VSCP-style) rare-class augmentation ----
+        # Runs before the geometric transform below, so the pasted region
+        # also gets rotated/flipped consistently along with the rest of
+        # the patch -- identical ordering to GenDEBRIS's MARIDA pipeline.
+        if self._rare_class_roi_indices and random.random() < self.copy_paste_prob:
+            img, mask = self._copy_paste_rare_classes(img, mask)
 
         if self.transform is not None:
             # Concatenate mask as an extra channel, exactly like

@@ -176,17 +176,27 @@ def main(options):
     transform_train = transforms.Compose(transform_steps)
     transform_val = transforms.Compose([transforms.ToTensor()])
 
+    rare_classes = [int(c) for c in options['rare_classes'].split(',') if c.strip() != '']
+    if options['copy_paste_prob'] > 0:
+        logging.info("Copy-paste (VSCP-style) augmentation: prob=%.2f, rare_classes=%s (MARIDA label space).",
+                      options['copy_paste_prob'], rare_classes)
+
     train_dataset = MADOSDataset(
         options['mados_path'], split='train', transform=transform_train,
         use_spectral_indices=options['use_spectral_indices'],
         use_texture_features=options['use_texture_features'],
         standardization=standardization, splits_path=options['splits_path'],
+        rare_classes=rare_classes, copy_paste_prob=options['copy_paste_prob'],
     )
     val_dataset = MADOSDataset(
         options['mados_path'], split='val', transform=transform_val,
         use_spectral_indices=options['use_spectral_indices'],
         use_texture_features=options['use_texture_features'],
         standardization=standardization, splits_path=options['splits_path'],
+        # No rare_classes/copy_paste_prob here: copy-paste is a train-only
+        # augmentation, matching GenDEBRIS's MARIDA convention -- val must
+        # stay deterministic for checkpoint-selection scores to be
+        # comparable across epochs.
     )
     print(f"Loaded {len(train_dataset)} MADOS train patches, {len(val_dataset)} val patches.")
     logging.info("Loaded %d train / %d val MADOS patches.", len(train_dataset), len(val_dataset))
@@ -362,6 +372,21 @@ if __name__ == '__main__':
     parser.add_argument('--dice_weight', default=0.5, type=float)
     parser.add_argument('--use_spectral_indices', default=False, type=bool)
     parser.add_argument('--use_texture_features', default=False, type=bool)
+    parser.add_argument('--rare_classes', default='0,2,3,8', type=str,
+                         help="Comma-separated MARIDA-label-space class indices (e.g. "
+                              "'0,2,3,8' = Marine Debris, Sparse Sargassum, Natural Organic "
+                              "Material, Foam) used as copy-paste donor/target classes. Same "
+                              "convention as train_swin_unetv2.py's --rare_classes. Only takes "
+                              "effect if --copy_paste_prob > 0.")
+    parser.add_argument('--copy_paste_prob', default=0.0, type=float,
+                         help="Probability of pasting rare-class pixels (see --rare_classes) "
+                              "from a randomly chosen donor ROI onto each training sample -- "
+                              "MADOS's own VSCP (Very Simple Copy-Paste) augmentation, "
+                              "confirmed to have been used by MariNeXt's authors (Kikaki et "
+                              "al., 2024) to help with severe rare-class imbalance (e.g. "
+                              "Sparse Sargassum, which scored under 12%% F1 across every "
+                              "architecture/loss combination tested without this). Default "
+                              "0.0 = off. Train-only; never applied to val/test.")
     parser.add_argument('--use_pretrained', default=True, type=bool,
                          help='Load ImageNet-pretrained Swin V2 weights (same channel-adaptation '
                               'logic as the MARIDA training script -- works regardless of '
