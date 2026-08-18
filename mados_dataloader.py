@@ -219,31 +219,33 @@ class MADOSDataset(Dataset):
             deterministic val/test. Required (not optional), since
             ToTensor is what performs the numpy->tensor + HWC->CHW
             conversion.
-        rare_classes (list[int], optional): MARIDA-space class indices
-            (post-crosswalk, e.g. 2 = Sparse Sargassum) to treat as
-            copy-paste donors. Matches GenDEBRIS's --rare_classes
-            convention so the two pipelines stay consistent.
-        copy_paste_prob (float): probability of applying copy-paste to
-            a given training sample, matching MADOS's own VSCP (Very
-            Simple Copy-Paste) augmentation, confirmed to have been used
-            by MariNeXt's authors (Kikaki et al., 2024) to help with
-            exactly the same kind of severe rare-class imbalance you'd
-            see with Sparse Sargassum on this dataset. Should only be
-            set > 0 for the TRAIN split -- val/test must stay
-            deterministic.
+        use_glcm_texture (bool): load TRUE precomputed GLCM texture
+            features (Contrast, Dissimilarity, Homogeneity, Energy,
+            Correlation, ASM -- 6 channels) from
+            <scene>_L2R_glcm_<crop>.tif, produced by running
+            precompute_mados_glcm.py FIRST. This is mutually exclusive
+            with use_texture_features (the fast live-computed std/
+            gradient proxy) -- if both are True, GLCM takes priority
+            and the fast proxy is skipped, since GLCM is strictly the
+            more faithful (if slower to produce) feature set.
     """
 
     def __init__(self, mados_path, split='train', transform=None,
                  use_spectral_indices=False, use_texture_features=False,
-                 standardization=None, splits_path=None,
-                 rare_classes=None, copy_paste_prob=0.0):
+                 standardization=None, splits_path=None, use_glcm_texture=False,
+                 spectral_jitter_prob=0.0, spectral_jitter_strength=0.05):
         from osgeo import gdal
 
         self._gdal = gdal
         self.mados_path = mados_path
         self.transform = transform
         self.use_spectral_indices = use_spectral_indices
-        self.use_texture_features = use_texture_features
+        self.use_glcm_texture = use_glcm_texture
+        # GLCM (if enabled) replaces the fast proxy rather than stacking
+        # both -- they're two versions of the same idea, not complementary.
+        self.use_texture_features = use_texture_features and not use_glcm_texture
+        self.spectral_jitter_prob = spectral_jitter_prob
+        self.spectral_jitter_strength = spectral_jitter_strength
         self.standardization = standardization
         self.n_raw_bands = len(BANDS_MEAN)
 
@@ -268,125 +270,79 @@ class MADOSDataset(Dataset):
         with open(split_file) as f:
             self.rois = [line.strip() for line in f if line.strip()]
 
-        self.rare_classes = list(rare_classes) if rare_classes else []
-        self.copy_paste_prob = copy_paste_prob
-        self._rare_class_roi_indices = []
-        if self.copy_paste_prob > 0:
-            if not self.rare_classes:
-                logging.warning(
-                    "MADOSDataset(%s): copy_paste_prob=%.2f but rare_classes is empty -- "
-                    "copy-paste augmentation will be a no-op.", split, self.copy_paste_prob
-                )
-            else:
-                self._rare_class_roi_indices = self._index_rare_class_rois()
-                if not self._rare_class_roi_indices:
-                    logging.warning(
-                        "MADOSDataset(%s): no ROIs contain any of rare_classes=%s (in MARIDA "
-                        "label space) -- copy-paste augmentation will be a no-op.",
-                        split, self.rare_classes
-                    )
-                else:
-                    logging.info(
-                        "MADOSDataset(%s): copy-paste (VSCP-style) augmentation enabled "
-                        "(prob=%.2f), %d/%d ROIs available as donors for rare_classes=%s.",
-                        split, self.copy_paste_prob, len(self._rare_class_roi_indices),
-                        len(self.rois), self.rare_classes
-                    )
-
     def __len__(self):
         return len(self.rois)
 
-    def _roi_to_paths(self, roi):
-        """Shared helper: ROI name -> (img_path, mask_path), matching __getitem__'s logic."""
-        scene_id, crop_id = roi.rsplit('_', 1)
-        img_path = os.path.join(self.mados_path, scene_id, f'{scene_id}_L2R_rhorc_{crop_id}.tif')
-        mask_path = os.path.join(self.mados_path, scene_id, f'{scene_id}_L2R_cl_{crop_id}.tif')
-        return img_path, mask_path
+    def _spectral_jitter(self, img):
+        """
+        Multiply each band of a (C, H, W) tensor by an independent random
+        factor in [1 - spectral_jitter_strength, 1 + spectral_jitter_strength],
+        simulating realistic Sentinel-2 sensor/atmospheric variation. Same
+        logic as GenDEBRIS._spectral_jitter in dataloader.py (MARIDA).
+        """
+        num_bands = img.shape[0]
+        factors = 1.0 + (torch.rand(num_bands, 1, 1) * 2 - 1) * self.spectral_jitter_strength
+        return img * factors
 
-    def _index_rare_class_rois(self):
+    def compute_sample_weights(self, rare_classes, boost=5.0):
         """
-        One-time scan (at construction) over every ROI's mask file to find
-        which ones contain at least one of self.rare_classes, AFTER
-        remapping to MARIDA's label space -- so --rare_classes uses the
-        same class-index convention as the rest of the pipeline (e.g. 2 =
-        Sparse Sargassum), not MADOS's raw 15-class codes. Unlike
-        GenDEBRIS, MADOSDataset doesn't preload every mask into memory, so
-        this reads each mask file once, here, rather than reusing an
-        already-loaded array.
+        Compute a per-ROI sampling weight, for use with
+        torch.utils.data.WeightedRandomSampler, so that patches containing
+        rare classes get drawn more often during training than patches
+        that don't -- on top of (not instead of) any loss-level class
+        weighting from gen_weights(). This is a SAFER, more established
+        alternative to copy-paste augmentation: it only changes how often
+        a real, unmodified patch is drawn, never synthesizes or alters
+        image content the way copy-paste does.
+
+        Unlike GenDEBRIS (which has every mask preloaded in self.masks),
+        MADOSDataset loads lazily, so this does a one-time scan over every
+        ROI's mask file here, applying the same crosswalk remapping
+        (remap_mados_mask) so rare_classes are specified in MARIDA's
+        label space (e.g. 2 = Sparse Sargassum), matching the rest of
+        this pipeline's convention.
+
+        Args:
+            rare_classes (list[int]): 0-indexed MARIDA-space class IDs
+                considered rare/underperforming and worth oversampling.
+            boost (float): extra weight added per rare class present in a
+                patch. A patch with none of the rare classes present gets
+                the base weight of 1.0; a patch with one rare class
+                present gets 1.0 + boost; a patch with two gets
+                1.0 + 2*boost, and so on.
+
+        Returns:
+            list[float]: one weight per ROI, in the same order as
+                self.rois (i.e. dataset index order).
         """
-        donor_indices = []
-        for i, roi in enumerate(self.rois):
-            _, mask_path = self._roi_to_paths(roi)
+        weights = []
+        for roi in self.rois:
+            scene_id, crop_id = roi.rsplit('_', 1)
+            mask_path = os.path.join(self.mados_path, scene_id, f'{scene_id}_L2R_cl_{crop_id}.tif')
             ds = self._gdal.Open(mask_path)
             if ds is None:
+                weights.append(1.0)  # can't read it; don't let it crash the whole scan
                 continue
             raw_mask = ds.ReadAsArray().astype(np.int64)
             ds = None
             remapped = remap_mados_mask(raw_mask)
-            if np.isin(remapped, self.rare_classes).any():
-                donor_indices.append(i)
-        return donor_indices
-
-    def _copy_paste_rare_classes(self, img, mask):
-        """
-        Paste rare-class pixels from a randomly chosen donor ROI (one
-        known to contain at least one rare class, see
-        _index_rare_class_rois) onto (img, mask), at the same spatial
-        positions -- same VSCP-style idea as GenDEBRIS's copy-paste for
-        MARIDA. The donor is loaded fresh here (lazily), matching
-        MADOSDataset's overall lazy-loading design.
-
-        Args:
-            img (np.ndarray): (H, W, C) image, already NaN-imputed and
-                resized to 256x256, with any extra channels (spectral
-                indices/texture) already appended if enabled.
-            mask (np.ndarray): (H, W) MARIDA-space integer class labels
-                (already remapped + resized), -1 = ignore.
-
-        Returns:
-            (np.ndarray, np.ndarray): augmented (img, mask), same shapes.
-        """
-        donor_idx = random.choice(self._rare_class_roi_indices)
-        donor_roi = self.rois[donor_idx]
-        donor_img_path, donor_mask_path = self._roi_to_paths(donor_roi)
-
-        ds = self._gdal.Open(donor_img_path)
-        donor_img = ds.ReadAsArray().astype(np.float32)  # (C, H, W)
-        ds = None
-        donor_img = np.moveaxis(donor_img, 0, -1)  # (H, W, C)
-
-        ds = self._gdal.Open(donor_mask_path)
-        donor_mask_raw = ds.ReadAsArray().astype(np.int64)
-        ds = None
-        donor_mask = remap_mados_mask(donor_mask_raw)
-
-        donor_img, donor_mask = resize_to_256(donor_img, donor_mask)
-
-        donor_nan_mask = np.isnan(donor_img)
-        band_means = np.tile(BANDS_MEAN, (donor_img.shape[0], donor_img.shape[1], 1))
-        donor_img[donor_nan_mask] = band_means[donor_nan_mask]
-
-        if self.use_spectral_indices or self.use_texture_features:
-            parts = []
-            if self.use_spectral_indices:
-                parts.append(compute_spectral_indices(donor_img))
-            if self.use_texture_features:
-                parts.append(compute_texture_features(donor_img))
-            donor_img = np.concatenate([donor_img] + parts, axis=-1)
-
-        paste_mask = np.isin(donor_mask, self.rare_classes)
-        if not paste_mask.any():
-            return img, mask  # shouldn't happen given _rare_class_roi_indices, but stay safe
-
-        img = img.copy()
-        mask = mask.copy()
-        img[paste_mask] = donor_img[paste_mask]
-        mask[paste_mask] = donor_mask[paste_mask]
-        return img, mask
+            n_rare_present = sum(1 for c in rare_classes if np.any(remapped == c))
+            weights.append(1.0 + boost * n_rare_present)
+        return weights
 
     def __getitem__(self, index):
         roi = self.rois[index]
-        img_path, mask_path = self._roi_to_paths(roi)
+        # CONFIRMED against real stacked data: ROI names are
+        # 'Scene_<scene_id>_<crop_id>' (e.g. 'Scene_54_30'). The stacked
+        # files live under Scene_<scene_id>/ with product-specific infixes:
+        #   Scene_<scene_id>_L2R_rhorc_<crop_id>.tif  -- stacked multiband image
+        #   Scene_<scene_id>_L2R_cl_<crop_id>.tif     -- class mask
+        #   Scene_<scene_id>_L2R_glcm_<crop_id>.tif   -- precomputed GLCM (6-band),
+        #                                                 only if precompute_mados_glcm.py has run
+        # NOT a flat 'patches/<roi>.tif' layout like MARIDA's.
+        scene_id, crop_id = roi.rsplit('_', 1)
+        img_path = os.path.join(self.mados_path, scene_id, f'{scene_id}_L2R_rhorc_{crop_id}.tif')
+        mask_path = os.path.join(self.mados_path, scene_id, f'{scene_id}_L2R_cl_{crop_id}.tif')
 
         ds = self._gdal.Open(img_path)
         img = ds.ReadAsArray().astype(np.float32)  # (C, H, W)
@@ -398,27 +354,53 @@ class MADOSDataset(Dataset):
 
         mask = remap_mados_mask(mask)
 
-        img = np.moveaxis(img, 0, -1)  # (H, W, C)
+        img = np.moveaxis(img, 0, -1)  # (H, W, 11)
+
+        n_glcm_bands = 0
+        if self.use_glcm_texture:
+            glcm_path = os.path.join(self.mados_path, scene_id, f'{scene_id}_L2R_glcm_{crop_id}.tif')
+            if not os.path.exists(glcm_path):
+                raise FileNotFoundError(
+                    f"use_glcm_texture=True but no precomputed GLCM file found at {glcm_path}. "
+                    f"Run precompute_mados_glcm.py --mados_path {self.mados_path} first."
+                )
+            ds = self._gdal.Open(glcm_path)
+            glcm = ds.ReadAsArray().astype(np.float32)  # (6, H, W)
+            ds = None
+            glcm = np.moveaxis(glcm, 0, -1)  # (H, W, 6)
+            n_glcm_bands = glcm.shape[-1]
+            # Concatenate onto the raw bands BEFORE resize_to_256, so both
+            # get padded/cropped identically and stay spatially aligned --
+            # the GLCM file was computed on the same native (240x240)
+            # resolution as the raw rhorc file, not the 256x256 model input.
+            img = np.concatenate([img, glcm], axis=-1)  # (H, W, 11+6)
+
         img, mask = resize_to_256(img, mask)
 
         nan_mask = np.isnan(img)
         band_means = np.tile(BANDS_MEAN, (img.shape[0], img.shape[1], 1))
+        if n_glcm_bands:
+            # BANDS_MEAN only covers the 11 raw bands -- pad with zeros for
+            # the GLCM channels' NaN-fill value (should be rare; GLCM
+            # properties are all well-defined in [0,1]-ish ranges with no
+            # natural NaNs from compute_glcm_features, this is a safety net).
+            band_means = np.concatenate([band_means, np.zeros(img.shape[:2] + (n_glcm_bands,), dtype=np.float32)], axis=-1)
         img[nan_mask] = band_means[nan_mask]
 
-        if self.use_spectral_indices or self.use_texture_features:
+        raw_img = img[..., :self.n_raw_bands]
+        glcm_img = img[..., self.n_raw_bands:self.n_raw_bands + n_glcm_bands] if n_glcm_bands else None
+
+        if self.use_spectral_indices or self.use_texture_features or self.use_glcm_texture:
             parts = []
             if self.use_spectral_indices:
-                parts.append(compute_spectral_indices(img))
-            if self.use_texture_features:
-                parts.append(compute_texture_features(img))
-            img = np.concatenate([img] + parts, axis=-1)
-
-        # ---- Copy-paste (VSCP-style) rare-class augmentation ----
-        # Runs before the geometric transform below, so the pasted region
-        # also gets rotated/flipped consistently along with the rest of
-        # the patch -- identical ordering to GenDEBRIS's MARIDA pipeline.
-        if self._rare_class_roi_indices and random.random() < self.copy_paste_prob:
-            img, mask = self._copy_paste_rare_classes(img, mask)
+                parts.append(compute_spectral_indices(raw_img))
+            if self.use_glcm_texture:
+                parts.append(glcm_img)
+            elif self.use_texture_features:
+                parts.append(compute_texture_features(raw_img))
+            img = np.concatenate([raw_img] + parts, axis=-1)
+        else:
+            img = raw_img
 
         if self.transform is not None:
             # Concatenate mask as an extra channel, exactly like
@@ -434,13 +416,18 @@ class MADOSDataset(Dataset):
             img_t = torch.from_numpy(np.moveaxis(img, -1, 0).astype(np.float32))
             mask = torch.from_numpy(mask)
 
-        if self.use_spectral_indices or self.use_texture_features:
+        if self.use_spectral_indices or self.use_texture_features or self.use_glcm_texture:
             raw = img_t[:self.n_raw_bands]
             extra = img_t[self.n_raw_bands:]
+            if self.spectral_jitter_prob > 0 and random.random() < self.spectral_jitter_prob:
+                raw = self._spectral_jitter(raw)
             if self.standardization is not None:
                 raw = self.standardization(raw)
             img_t = torch.cat([raw, extra], dim=0)
-        elif self.standardization is not None:
-            img_t = self.standardization(img_t)
+        else:
+            if self.spectral_jitter_prob > 0 and random.random() < self.spectral_jitter_prob:
+                img_t = self._spectral_jitter(img_t)
+            if self.standardization is not None:
+                img_t = self.standardization(img_t)
 
         return img_t, mask

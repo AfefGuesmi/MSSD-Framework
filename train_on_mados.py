@@ -48,7 +48,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -60,12 +60,13 @@ from mssd_net import build_mssd_net
 from dataloader import BANDS_MEAN, BANDS_STD, SPECTRAL_INDEX_NAMES, TEXTURE_FEATURE_NAMES, \
     RandomRotationTransform, gen_weights
 from mados_dataloader import MADOSDataset, MARIDA_LABELS, MARIDA_CLASSES_NOT_IN_MADOS
+from precompute_mados_glcm import GLCM_PROPERTIES as GLCM_FEATURE_NAMES
 from utils.metrics import Evaluation
 
 # Reuse the exact, already-tested loss classes and LR scheduler builder
 # from the MARIDA training script -- training behaviour matches as
 # closely as possible; only the data source and class-weight source differ.
-from train_swin_unetv2 import DiceLoss, CEDiceLoss, FocalLoss, build_scheduler, ensure_pretrained_checkpoint
+from train_swin_unetv2 import DiceLoss, CEDiceLoss, FocalLoss, build_scheduler, ensure_pretrained_checkpoint, build_param_groups
 
 os.makedirs(os.path.join(PROJECT_ROOT, 'trained_models'), exist_ok=True)
 os.makedirs(os.path.join(PROJECT_ROOT, 'logs'), exist_ok=True)
@@ -176,33 +177,55 @@ def main(options):
     transform_train = transforms.Compose(transform_steps)
     transform_val = transforms.Compose([transforms.ToTensor()])
 
-    rare_classes = [int(c) for c in options['rare_classes'].split(',') if c.strip() != '']
-    if options['copy_paste_prob'] > 0:
-        logging.info("Copy-paste (VSCP-style) augmentation: prob=%.2f, rare_classes=%s (MARIDA label space).",
-                      options['copy_paste_prob'], rare_classes)
-
     train_dataset = MADOSDataset(
         options['mados_path'], split='train', transform=transform_train,
         use_spectral_indices=options['use_spectral_indices'],
         use_texture_features=options['use_texture_features'],
+        use_glcm_texture=options['use_glcm_texture'],
+        spectral_jitter_prob=options['spectral_jitter_prob'],
+        spectral_jitter_strength=options['spectral_jitter_strength'],
         standardization=standardization, splits_path=options['splits_path'],
-        rare_classes=rare_classes, copy_paste_prob=options['copy_paste_prob'],
     )
     val_dataset = MADOSDataset(
         options['mados_path'], split='val', transform=transform_val,
         use_spectral_indices=options['use_spectral_indices'],
         use_texture_features=options['use_texture_features'],
+        use_glcm_texture=options['use_glcm_texture'],
         standardization=standardization, splits_path=options['splits_path'],
-        # No rare_classes/copy_paste_prob here: copy-paste is a train-only
-        # augmentation, matching GenDEBRIS's MARIDA convention -- val must
-        # stay deterministic for checkpoint-selection scores to be
-        # comparable across epochs.
     )
     print(f"Loaded {len(train_dataset)} MADOS train patches, {len(val_dataset)} val patches.")
     logging.info("Loaded %d train / %d val MADOS patches.", len(train_dataset), len(val_dataset))
 
-    train_loader = DataLoader(train_dataset, batch_size=options['batch'], shuffle=True,
-                               num_workers=options['num_workers'])
+    # ---- Rare-class oversampling ----
+    # Plain shuffle=True samples every patch with equal probability. Most
+    # patches barely contain Sparse Sargassum/Marine Debris/Foam pixels
+    # (Sparse Sargassum in particular has scored under 12% F1 across
+    # every architecture/loss combination tested), so the model sees
+    # very little of them per epoch even though loss-level class
+    # weighting tries to compensate after the fact. A WeightedRandomSampler
+    # instead makes patches that DO contain a rare class more likely to
+    # be drawn -- a safer alternative to copy-paste augmentation (which
+    # was tried and reverted): this only changes how often a real,
+    # unmodified patch is drawn, never synthesizes or alters image content.
+    if options['oversample_rare']:
+        rare_classes = [int(c) for c in options['rare_classes'].split(',') if c.strip() != '']
+        sample_weights = train_dataset.compute_sample_weights(rare_classes, boost=options['oversample_boost'])
+        logging.info(
+            "Rare-class oversampling enabled for classes %s (MARIDA label space, boost=%.1f "
+            "per class present). Per-patch weight range: [%.2f, %.2f]",
+            rare_classes, options['oversample_boost'], min(sample_weights), max(sample_weights)
+        )
+        print(f"Rare-class oversampling enabled for classes {rare_classes}, "
+              f"weight range [{min(sample_weights):.2f}, {max(sample_weights):.2f}]")
+        sampler = WeightedRandomSampler(
+            weights=sample_weights, num_samples=len(sample_weights), replacement=True
+        )
+        train_loader = DataLoader(train_dataset, batch_size=options['batch'],
+                                   sampler=sampler,  # sampler and shuffle are mutually exclusive
+                                   num_workers=options['num_workers'])
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=options['batch'], shuffle=True,
+                                   num_workers=options['num_workers'])
     val_loader = DataLoader(val_dataset, batch_size=options['batch'], shuffle=False,
                              num_workers=options['num_workers'])
 
@@ -212,8 +235,14 @@ def main(options):
     class_distribution = compute_mados_class_distribution(train_dataset)
     weight = gen_weights(class_distribution, c=1.02).to(device)
 
+    # IMPORTANT: mirrors MADOSDataset's own internal priority logic exactly
+    # -- if both use_texture_features and use_glcm_texture are True, GLCM
+    # wins and the fast proxy is skipped (not stacked), so the channel
+    # count must reflect that, not naively add both.
+    effective_use_texture_features = options['use_texture_features'] and not options['use_glcm_texture']
     n_extra = (len(SPECTRAL_INDEX_NAMES) if options['use_spectral_indices'] else 0) \
-        + (len(TEXTURE_FEATURE_NAMES) if options['use_texture_features'] else 0)
+        + (len(GLCM_FEATURE_NAMES) if options['use_glcm_texture'] else
+           (len(TEXTURE_FEATURE_NAMES) if effective_use_texture_features else 0))
     input_channels = 11 + n_extra
 
     config = Config()
@@ -246,7 +275,18 @@ def main(options):
         criterion = nn.CrossEntropyLoss(ignore_index=-1, reduction='mean', weight=weight)
     logging.info("Using loss_type=%s", options['loss_type'])
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=options['lr'], weight_decay=options['decay'])
+    if options['encoder_lr_mult'] != 1.0:
+        param_groups, n_encoder, n_other = build_param_groups(
+            model, options['lr'], options['encoder_lr_mult'], options['decay']
+        )
+        optimizer = torch.optim.Adam(param_groups)
+        logging.info(
+            "Differential LR enabled: %d pretrained-encoder params at lr=%.2e, "
+            "%d other params (decoder/MSSD/random-init) at lr=%.2e",
+            n_encoder, options['lr'] * options['encoder_lr_mult'], n_other, options['lr']
+        )
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=options['lr'], weight_decay=options['decay'])
     warmup_scheduler, main_scheduler, warmup_steps = build_scheduler(
         optimizer, options, steps_per_epoch=len(train_loader)
     )
@@ -371,28 +411,54 @@ if __name__ == '__main__':
     parser.add_argument('--focal_gamma', default=2.0, type=float)
     parser.add_argument('--dice_weight', default=0.5, type=float)
     parser.add_argument('--use_spectral_indices', default=False, type=bool)
-    parser.add_argument('--use_texture_features', default=False, type=bool)
+    parser.add_argument('--use_texture_features', default=False, type=bool,
+                         help="Fast local std-dev + gradient magnitude texture proxy, computed "
+                              "live. Ignored if --use_glcm_texture is also True (GLCM wins).")
+    parser.add_argument('--use_glcm_texture', default=False, type=bool,
+                         help="Use TRUE precomputed GLCM texture features (Contrast, "
+                              "Dissimilarity, Homogeneity, Energy, Correlation, ASM) instead of "
+                              "the fast proxy. REQUIRES running precompute_mados_glcm.py "
+                              "--mados_path <same path> FIRST -- this flag only loads cached "
+                              "<scene>_L2R_glcm_<crop>.tif files, it does not compute them. "
+                              "Matches MARIDA's own RF feature set (their single most important "
+                              "feature, per their own feature-importance analysis).")
+    parser.add_argument('--spectral_jitter_prob', default=0.0, type=float,
+                         help="Probability, per training sample, of multiplying each raw band "
+                              "by an independent random factor (see --spectral_jitter_strength), "
+                              "simulating realistic Sentinel-2 sensor/atmospheric variation. "
+                              "Same technique as GenDEBRIS's MARIDA pipeline. Train-only. "
+                              "Default 0.0 = off.")
+    parser.add_argument('--spectral_jitter_strength', default=0.05, type=float,
+                         help="Each band's multiplicative jitter factor is drawn uniformly from "
+                              "[1-strength, 1+strength]. Only used if --spectral_jitter_prob > 0.")
+    parser.add_argument('--oversample_rare', default=False, type=bool,
+                         help="Use a WeightedRandomSampler that oversamples training patches "
+                              "containing --rare_classes, instead of plain shuffle=True. "
+                              "Matches train_swin_unetv2.py's MARIDA convention. Default True.")
     parser.add_argument('--rare_classes', default='0,2,3,8', type=str,
                          help="Comma-separated MARIDA-label-space class indices (e.g. "
                               "'0,2,3,8' = Marine Debris, Sparse Sargassum, Natural Organic "
-                              "Material, Foam) used as copy-paste donor/target classes. Same "
-                              "convention as train_swin_unetv2.py's --rare_classes. Only takes "
-                              "effect if --copy_paste_prob > 0.")
-    parser.add_argument('--copy_paste_prob', default=0.0, type=float,
-                         help="Probability of pasting rare-class pixels (see --rare_classes) "
-                              "from a randomly chosen donor ROI onto each training sample -- "
-                              "MADOS's own VSCP (Very Simple Copy-Paste) augmentation, "
-                              "confirmed to have been used by MariNeXt's authors (Kikaki et "
-                              "al., 2024) to help with severe rare-class imbalance (e.g. "
-                              "Sparse Sargassum, which scored under 12%% F1 across every "
-                              "architecture/loss combination tested without this). Default "
-                              "0.0 = off. Train-only; never applied to val/test.")
+                              "Material, Foam) to oversample. Same convention as "
+                              "train_swin_unetv2.py's --rare_classes. Only used if "
+                              "--oversample_rare is True.")
+    parser.add_argument('--oversample_boost', default=5.0, type=float,
+                         help="Extra sampling weight added per rare class present in a patch "
+                              "(see compute_sample_weights). Only used if --oversample_rare.")
     parser.add_argument('--use_pretrained', default=True, type=bool,
                          help='Load ImageNet-pretrained Swin V2 weights (same channel-adaptation '
                               'logic as the MARIDA training script -- works regardless of '
                               'in_chans, verified earlier in this project).')
     parser.add_argument('--pretrained_path', default=None, type=str)
     parser.add_argument('--lr', default=1e-4, type=float)
+    parser.add_argument('--encoder_lr_mult', default=1.0, type=float,
+                         help="Multiplier applied to --lr for the ImageNet-pretrained encoder "
+                              "params (patch_embed + layers.*); everything else (decoder, MSSD "
+                              "modules, and the randomly-initialized relative-position-bias "
+                              "tensors) uses --lr directly. Default 1.0 = single shared LR "
+                              "(previous behavior, unchanged unless explicitly set). Try e.g. "
+                              "0.1 so pretrained ImageNet features move slower than the "
+                              "from-scratch parts. Reuses build_param_groups from "
+                              "train_swin_unetv2.py, verified against the real MSSDNet model.")
     parser.add_argument('--decay', default=1e-4, type=float)
     parser.add_argument('--scheduler', default='sgdr', choices=['sgdr', 'plateau', 'multistep', 'cosine'])
     parser.add_argument('--lr_steps', default=[45, 65], type=list)
