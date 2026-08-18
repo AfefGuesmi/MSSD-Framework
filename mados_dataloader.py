@@ -176,6 +176,19 @@ def remap_mados_mask(mados_mask):
     return remapped
 
 
+def remap_native_predictions_to_marida(pred_15class):
+    """
+    Given predictions made in MADOS's native 15-class space (0-indexed
+    class IDs, as produced by a model trained with native_15_classes=True),
+    remap them down to MARIDA's 11-class space for evaluation/reporting,
+    using the exact same crosswalk as remap_mados_mask. Predictions of a
+    class with no MARIDA equivalent (Oil Spills, Oil Platforms, Jellyfish,
+    Sea Snot) become -1 (excluded from evaluation), matching how those
+    classes are already excluded for a MARIDA-space-trained model.
+    """
+    return remap_mados_mask(pred_15class + 1)  # +1: remap_mados_mask expects 1-indexed raw codes
+
+
 def resize_to_256(img, mask, target=256):
     """Center pad-then-crop an (H, W, C) image and (H, W) mask to target x target.
     Padding uses reflect for the image and -1 (ignore_index) for the mask,
@@ -233,7 +246,8 @@ class MADOSDataset(Dataset):
     def __init__(self, mados_path, split='train', transform=None,
                  use_spectral_indices=False, use_texture_features=False,
                  standardization=None, splits_path=None, use_glcm_texture=False,
-                 spectral_jitter_prob=0.0, spectral_jitter_strength=0.05):
+                 spectral_jitter_prob=0.0, spectral_jitter_strength=0.05,
+                 native_15_classes=False):
         from osgeo import gdal
 
         self._gdal = gdal
@@ -248,6 +262,16 @@ class MADOSDataset(Dataset):
         self.spectral_jitter_strength = spectral_jitter_strength
         self.standardization = standardization
         self.n_raw_bands = len(BANDS_MEAN)
+        # native_15_classes: train on MADOS's own 15-class taxonomy
+        # directly (Oil Spills, Oil Platforms, Jellyfish, Sea Snot no
+        # longer thrown away as ignore_index), instead of remapping every
+        # mask down to MARIDA's 11 classes. Gives the model real learning
+        # signal from the ~4 extra classes' pixels too, which otherwise
+        # contribute nothing to the loss at all. Evaluation-time code
+        # (train_on_mados.py / evaluate_on_mados.py) still remaps
+        # PREDICTIONS down to MARIDA's 11-class space for reporting, so
+        # results stay comparable to non-native-15 runs.
+        self.native_15_classes = native_15_classes
 
         # CONFIRMED against real data: after running MADOS's own
         # utils/stack_patches.py, the stacked (usable) image data lands in
@@ -352,7 +376,14 @@ class MADOSDataset(Dataset):
         mask = ds.ReadAsArray().astype(np.int64)  # (H, W), MADOS's raw 1-indexed codes
         ds = None
 
-        mask = remap_mados_mask(mask)
+        if self.native_15_classes:
+            # Keep MADOS's own 0-indexed 15-class labels directly, no
+            # crosswalk applied -- only shift 1-indexed raw codes to
+            # 0-indexed (1..15 -> 0..14), same convention as MARIDA's own
+            # dataloader.py. No pixel is thrown away as ignore_index here.
+            mask = mask - 1
+        else:
+            mask = remap_mados_mask(mask)
 
         img = np.moveaxis(img, 0, -1)  # (H, W, 11)
 

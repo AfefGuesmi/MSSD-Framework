@@ -59,7 +59,7 @@ from utils.config import Config
 from mssd_net import build_mssd_net
 from dataloader import BANDS_MEAN, BANDS_STD, SPECTRAL_INDEX_NAMES, TEXTURE_FEATURE_NAMES, \
     RandomRotationTransform, gen_weights
-from mados_dataloader import MADOSDataset, MARIDA_LABELS, MARIDA_CLASSES_NOT_IN_MADOS
+from mados_dataloader import MADOSDataset, MARIDA_LABELS, MARIDA_CLASSES_NOT_IN_MADOS, remap_native_predictions_to_marida
 from precompute_mados_glcm import GLCM_PROPERTIES as GLCM_FEATURE_NAMES
 from utils.metrics import Evaluation
 
@@ -83,20 +83,24 @@ def seed_all(seed=0):
     torch.cuda.manual_seed_all(seed)
 
 
-def compute_mados_class_distribution(train_dataset):
+def compute_mados_class_distribution(train_dataset, native_15_classes=False, model_output_classes=11):
     """
     One-time pass over the MADOS training split's masks to compute the
-    empirical class distribution in MARIDA's 11-class space (after the
-    crosswalk remapping), for use with gen_weights(). MADOSDataset
+    empirical class distribution, for use with gen_weights(). MADOSDataset
     doesn't preload masks into memory the way GenDEBRIS does, so this
-    scans the raw mask rasters directly and reuses the same remapping
-    logic, rather than loading full patches through the Dataset
-    __getitem__ (which would also apply augmentation/standardization
-    unnecessarily for this one-time count).
-    """
-    from mados_dataloader import remap_mados_mask
+    scans the raw mask rasters directly, rather than loading full patches
+    through the Dataset __getitem__ (which would also apply augmentation/
+    standardization unnecessarily for this one-time count).
 
-    counts = np.zeros(NUM_CLASSES, dtype=np.int64)
+    If native_15_classes=True, the distribution is computed over MADOS's
+    own 15-class taxonomy directly (no crosswalk, no pixels excluded --
+    matches what the model is actually being trained to predict). If
+    False (default), matches the original MARIDA-11-class-space behavior.
+    """
+    from mados_dataloader import remap_mados_mask, MADOS_LABELS
+
+    label_names = MADOS_LABELS if native_15_classes else MARIDA_LABELS
+    counts = np.zeros(model_output_classes, dtype=np.int64)
     for roi in tqdm(train_dataset.rois, desc="Scanning MADOS train masks for class distribution"):
         scene_id, crop_id = roi.rsplit('_', 1)
         mask_path = os.path.join(train_dataset.mados_path, scene_id, f'{scene_id}_L2R_cl_{crop_id}.tif')
@@ -105,19 +109,23 @@ def compute_mados_class_distribution(train_dataset):
             continue
         raw_mask = ds.ReadAsArray().astype(np.int64)
         ds = None
-        remapped = remap_mados_mask(raw_mask)
+        if native_15_classes:
+            remapped = raw_mask - 1  # 1-indexed raw -> 0-indexed native, nothing excluded
+        else:
+            remapped = remap_mados_mask(raw_mask)
         valid = remapped[remapped != -1]
         if valid.size > 0:
-            counts += np.bincount(valid, minlength=NUM_CLASSES)[:NUM_CLASSES]
+            counts += np.bincount(valid, minlength=model_output_classes)[:model_output_classes]
 
     total = counts.sum()
     if total == 0:
         raise RuntimeError("No valid (non-ignored, mapped) pixels found anywhere in the MADOS "
                             "training split -- check the crosswalk and file paths before proceeding.")
     distribution = counts.astype(np.float64) / total
-    logging.info("MADOS training-split class distribution (MARIDA label space): %s", dict(zip(MARIDA_LABELS, distribution.round(4))))
-    print("MADOS training-split class distribution (MARIDA label space):")
-    for name, freq, count in zip(MARIDA_LABELS, distribution, counts):
+    space = "native 15-class" if native_15_classes else "MARIDA 11-class"
+    logging.info("MADOS training-split class distribution (%s space): %s", space, dict(zip(label_names, distribution.round(4))))
+    print(f"MADOS training-split class distribution ({space} space):")
+    for name, freq, count in zip(label_names, distribution, counts):
         print(f"  {name:28s}: {freq*100:6.2f}%  ({count} pixels)")
     return torch.tensor(distribution, dtype=torch.float32)
 
@@ -184,6 +192,7 @@ def main(options):
         use_glcm_texture=options['use_glcm_texture'],
         spectral_jitter_prob=options['spectral_jitter_prob'],
         spectral_jitter_strength=options['spectral_jitter_strength'],
+        native_15_classes=options['native_15_classes'],
         standardization=standardization, splits_path=options['splits_path'],
     )
     val_dataset = MADOSDataset(
@@ -191,6 +200,10 @@ def main(options):
         use_spectral_indices=options['use_spectral_indices'],
         use_texture_features=options['use_texture_features'],
         use_glcm_texture=options['use_glcm_texture'],
+        # native_15_classes deliberately NOT set here -- val/checkpoint-
+        # selection always stays in MARIDA's 11-class space, regardless of
+        # whether the model is being trained with the auxiliary 15-class
+        # signal, so results stay comparable across both modes.
         standardization=standardization, splits_path=options['splits_path'],
     )
     print(f"Loaded {len(train_dataset)} MADOS train patches, {len(val_dataset)} val patches.")
@@ -232,7 +245,20 @@ def main(options):
     # Class weights from MADOS's OWN training distribution -- MARIDA's
     # CLASS_DISTR constant does not apply here, since MADOS's class
     # balance (and complete absence of Clouds) is different.
-    class_distribution = compute_mados_class_distribution(train_dataset)
+    #
+    # model_output_classes: 15 if training on MADOS's own native taxonomy
+    # (native_15_classes=True -- gives the model real learning signal from
+    # Oil Spills/Oil Platforms/Jellyfish/Sea Snot pixels too, which
+    # otherwise contribute nothing to the loss at all), else 11 (MARIDA's
+    # space, the original/default behavior). Checkpoint selection and
+    # reported metrics ALWAYS stay in MARIDA's 11-class space either way
+    # (see remap_native_predictions_to_marida below) -- this only changes
+    # what the model is trained to predict, not what gets reported.
+    model_output_classes = 15 if options['native_15_classes'] else NUM_CLASSES
+    class_distribution = compute_mados_class_distribution(
+        train_dataset, native_15_classes=options['native_15_classes'],
+        model_output_classes=model_output_classes
+    )
     weight = gen_weights(class_distribution, c=1.02).to(device)
 
     # IMPORTANT: mirrors MADOSDataset's own internal priority logic exactly
@@ -252,7 +278,7 @@ def main(options):
         img_size=config.DATA.IMG_SIZE,
         patch_size=getattr(swin_cfg, 'PATCH_SIZE', 4),
         in_chans=input_channels,
-        num_classes=NUM_CLASSES,
+        num_classes=model_output_classes,
         embed_dim=getattr(swin_cfg, 'EMBED_DIM', 96),
         depths=getattr(swin_cfg, 'DEPTHS', [2, 2, 2, 2]),
         depths_decoder=getattr(swin_cfg, 'DEPTHS_DECODER', [1, 2, 2, 2]),
@@ -267,9 +293,9 @@ def main(options):
     if options['loss_type'] == 'focal':
         criterion = FocalLoss(alpha=weight, gamma=options['focal_gamma'], ignore_index=-1, reduction='mean')
     elif options['loss_type'] == 'dice':
-        criterion = DiceLoss(num_classes=NUM_CLASSES, weight=weight, ignore_index=-1)
+        criterion = DiceLoss(num_classes=model_output_classes, weight=weight, ignore_index=-1)
     elif options['loss_type'] == 'ce_dice':
-        criterion = CEDiceLoss(num_classes=NUM_CLASSES, weight=weight, ignore_index=-1,
+        criterion = CEDiceLoss(num_classes=model_output_classes, weight=weight, ignore_index=-1,
                                 dice_weight=options['dice_weight'])
     else:
         criterion = nn.CrossEntropyLoss(ignore_index=-1, reduction='mean', weight=weight)
@@ -327,12 +353,34 @@ def main(options):
                     images, targets = images.to(device), targets.to(device)
                     logits = model(images)
                     probs = torch.nn.functional.softmax(logits, dim=1)
-                    probs = torch.movedim(probs, 1, -1).reshape(-1, NUM_CLASSES)
+                    # Reshape using the model's ACTUAL output channel count
+                    # (15 in native_15_classes mode, 11 otherwise) -- using
+                    # the fixed NUM_CLASSES=11 here would crash in native
+                    # mode, since the model genuinely outputs 15 channels.
+                    probs = torch.movedim(probs, 1, -1).reshape(-1, model_output_classes)
                     targets = targets.reshape(-1)
                     mask = targets != -1
                     probs, targets = probs[mask], targets[mask]
-                    y_pred += probs.cpu().numpy().argmax(1).tolist()
-                    y_true += targets.cpu().numpy().tolist()
+
+                    pred_classes = probs.cpu().numpy().argmax(1)
+                    if options['native_15_classes']:
+                        # val_dataset's targets are already in MARIDA's
+                        # 11-class space (native_15_classes=False for
+                        # val_dataset, by design -- see its construction
+                        # above), but the model's predictions are still in
+                        # native 15-class space, so remap predictions down
+                        # before comparing. Predictions of a class with no
+                        # MARIDA equivalent (Oil Spills etc.) become -1 and
+                        # must be excluded here too, same as targets==-1.
+                        pred_classes = remap_native_predictions_to_marida(pred_classes)
+                        valid_pred = pred_classes != -1
+                        pred_classes = pred_classes[valid_pred]
+                        targets_np = targets.cpu().numpy()[valid_pred]
+                    else:
+                        targets_np = targets.cpu().numpy()
+
+                    y_pred += pred_classes.tolist()
+                    y_true += targets_np.tolist()
 
             if not y_true:
                 logging.warning("Epoch %d: no valid val pixels found -- skipping checkpoint check.", epoch)
@@ -414,6 +462,19 @@ if __name__ == '__main__':
     parser.add_argument('--use_texture_features', default=False, type=bool,
                          help="Fast local std-dev + gradient magnitude texture proxy, computed "
                               "live. Ignored if --use_glcm_texture is also True (GLCM wins).")
+    parser.add_argument('--native_15_classes', default=False, type=bool,
+                         help="Train on MADOS's own 15-class taxonomy directly, instead of "
+                              "remapping every mask down to MARIDA's 11 classes. Gives the "
+                              "model real learning signal from the ~4 extra classes' pixels "
+                              "(Oil Spills, Oil Platforms, Jellyfish, Sea Snot) that are "
+                              "otherwise thrown away as ignore_index -- a form of auxiliary-"
+                              "task learning that may improve shared feature representations "
+                              "even for the 11 classes actually reported. Model output layer "
+                              "becomes 15 channels. Checkpoint selection and reported metrics "
+                              "STILL happen in MARIDA's 11-class space (predictions are "
+                              "remapped down for scoring, via remap_native_predictions_to_marida) "
+                              "so results stay directly comparable to non-native runs. "
+                              "Default False = original behavior, unchanged.")
     parser.add_argument('--use_glcm_texture', default=False, type=bool,
                          help="Use TRUE precomputed GLCM texture features (Contrast, "
                               "Dissimilarity, Homogeneity, Energy, Correlation, ASM) instead of "
