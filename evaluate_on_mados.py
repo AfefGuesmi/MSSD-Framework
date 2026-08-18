@@ -101,6 +101,13 @@ from mados_dataloader import (
 )
 from utils.metrics import Evaluation
 
+# Same 6 property names as precompute_mados_glcm.py's GLCM_PROPERTIES --
+# defined directly here (not imported) so this script only needs
+# mados_dataloader.py to run --use_glcm_texture evaluation; the actual
+# GLCM computation script is only needed once, to generate the cached
+# feature files themselves, not at import time here.
+GLCM_FEATURE_NAMES = ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM']
+
 try:
     from utils.metrics import confusion_matrix
 except ImportError:
@@ -168,6 +175,7 @@ def main(options):
             options['mados_path'], split=options['mados_split'], transform=transform_deterministic,
             use_spectral_indices=options['use_spectral_indices'],
             use_texture_features=options['use_texture_features'],
+            use_glcm_texture=options['use_glcm_texture'],
             standardization=standardization, splits_path=options['mados_splits_path'],
         )
         print(f"Loaded {len(dataset)} MADOS patches (split={options['mados_split']}).")
@@ -281,7 +289,13 @@ if __name__ == '__main__':
     parser.add_argument('--output_channels', default=11, type=int)
     parser.add_argument('--input_channels', default=11, type=int)
     parser.add_argument('--use_spectral_indices', default=False, type=bool)
-    parser.add_argument('--use_texture_features', default=False, type=bool)
+    parser.add_argument('--use_texture_features', default=False, type=bool,
+                         help="Fast local std-dev + gradient magnitude proxy. Ignored if "
+                              "--use_glcm_texture is also True.")
+    parser.add_argument('--use_glcm_texture', default=False, type=bool,
+                         help="Must match the --use_glcm_texture setting the checkpoint was "
+                              "trained with. Requires precompute_mados_glcm.py to have been "
+                              "run against --mados_path. Only relevant for --dataset mados.")
     parser.add_argument('--tta', default=True, type=bool)
     parser.add_argument('--tta_rotations', default='[0,180]', type=str)
     parser.add_argument('--tta_hflip', default=False, type=bool)
@@ -295,8 +309,14 @@ if __name__ == '__main__':
     if not isinstance(options['tta_rotations'], (list, tuple)):
         options['tta_rotations'] = [options['tta_rotations']]
 
+    # IMPORTANT: mirrors MADOSDataset's own internal priority logic exactly
+    # -- if both use_texture_features and use_glcm_texture are True, GLCM
+    # wins and the fast proxy is skipped (not stacked). Only relevant for
+    # --dataset mados; --dataset marida never sets use_glcm_texture.
+    effective_use_texture_features = options['use_texture_features'] and not options.get('use_glcm_texture', False)
     n_extra = (len(SPECTRAL_INDEX_NAMES) if options['use_spectral_indices'] else 0) \
-        + (len(TEXTURE_FEATURE_NAMES) if options['use_texture_features'] else 0)
+        + (len(GLCM_FEATURE_NAMES) if options.get('use_glcm_texture', False) else
+           (len(TEXTURE_FEATURE_NAMES) if effective_use_texture_features else 0))
     options['input_channels'] = 11 + n_extra
 
     main(options)

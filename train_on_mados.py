@@ -60,13 +60,19 @@ from mssd_net import build_mssd_net
 from dataloader import BANDS_MEAN, BANDS_STD, SPECTRAL_INDEX_NAMES, TEXTURE_FEATURE_NAMES, \
     RandomRotationTransform, gen_weights
 from mados_dataloader import MADOSDataset, MARIDA_LABELS, MARIDA_CLASSES_NOT_IN_MADOS, remap_native_predictions_to_marida
-from precompute_mados_glcm import GLCM_PROPERTIES as GLCM_FEATURE_NAMES
 from utils.metrics import Evaluation
 
 # Reuse the exact, already-tested loss classes and LR scheduler builder
 # from the MARIDA training script -- training behaviour matches as
 # closely as possible; only the data source and class-weight source differ.
 from train_swin_unetv2 import DiceLoss, CEDiceLoss, FocalLoss, build_scheduler, ensure_pretrained_checkpoint, build_param_groups
+
+# Same 6 property names as precompute_mados_glcm.py's GLCM_PROPERTIES --
+# defined directly here (not imported) so this script only needs
+# mados_dataloader.py to run --use_glcm_texture training; the actual GLCM
+# computation script (precompute_mados_glcm.py) is only needed once, to
+# generate the cached feature files themselves, not at import time here.
+GLCM_FEATURE_NAMES = ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM']
 
 os.makedirs(os.path.join(PROJECT_ROOT, 'trained_models'), exist_ok=True)
 os.makedirs(os.path.join(PROJECT_ROOT, 'logs'), exist_ok=True)
